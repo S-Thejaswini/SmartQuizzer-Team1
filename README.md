@@ -27,32 +27,6 @@ This project bridges the gap between **static quizzes** and **adaptive, AI-drive
 
 ---
 
-## 🧩 System Architecture  
-
-+------------------------------------------------------+
-|                  **FRONTEND**                        |
-|  HTML | CSS | JavaScript | Flask Templates (Jinja2)  |
-+----------------------------+-------------------------+
-                             |
-                             ▼
-+----------------------- BACKEND ----------------------+
-| Flask REST API | Flask-SQLAlchemy ORM | Werkzeug     |
-| python-dotenv (env mgmt) | Groq (AI engine)          |
-+------------------------------------------------------+
-                             |
-                             ▼
-+------------------------- DATABASE -------------------+
-|                    SQLite Database                   |
-|   Stores users, questions, results, and feedback     |
-+------------------------------------------------------+
-                             |
-                             ▼
-+--------------------- CONTENT EXTRACTION -------------+
-| PyMuPDF (PDF parser) | BeautifulSoup4 (Web scraping) |
-| Requests (HTTP fetcher)                              |
-+------------------------------------------------------+
-
----
 
 ## 🛠️ Tech Stack  
 
@@ -99,60 +73,58 @@ This project bridges the gap between **static quizzes** and **adaptive, AI-drive
 
 ## ⚙️ Installation & Setup  
 
-### 1️⃣ Clone the Repository  
-git clone https://github.com/<your-username>/AI-SmartQuizzer.git
-cd AI-SmartQuizzer
-### 2️⃣ Create a Virtual Environment
-python -m venv venv
-### 3️⃣ Activate the Virtual Environment
-Linux / macOS
-source venv/bin/activate
+1️⃣ Clone the Repository  
+git clone https://github.com/<your-username>/AI-SmartQuizzer.git  
+cd AI-SmartQuizzer  
+2️⃣ Create a Virtual Environment    
+python -m venv venv  
+3️⃣ Activate the Virtual Environment    
+Linux / macOS  
+source venv/bin/activate  
 
-Windows (PowerShell)
-venv\Scripts\Activate.ps1
+Windows (PowerShell)  
+venv\Scripts\Activate.ps1  
 
-Windows (CMD)
-venv\Scripts\activate
+Windows (CMD)  
+venv\Scripts\activate  
 
-### 4️⃣ Install Dependencies
-pip install -r requirements.txt
+4️⃣ Install Dependencies  
+pip install -r requirements.txt  
 
-### 5️⃣ Set Up Environment Variables
+5️⃣ Set Up Environment Variables  
 
-Create a .env file in your project root and add:
+Create a .env file in your project root and add:  
 
-GROQ_API_KEY=your_groq_api_key_here
-FLASK_ENV=development
-DATABASE_URL=sqlite:///quizzer.db
+GROQ_API_KEY=your_groq_api_key_here  
+FLASK_ENV=development  
+DATABASE_URL=sqlite:///quizzer.db   
 
+Note: Replace your_groq_api_key_here with your actual API key from Groq  
+For production deployment, change FLASK_ENV=production.  
 
-Note: Replace your_groq_api_key_here with your actual API key from Groq
-.
-For production deployment, change FLASK_ENV=production.
+### 6️⃣ Run the Application  
+flask run  
 
-### 6️⃣ Run the Application
-flask run
+Visit the app at:  
+👉 http://127.0.0.1:5000  
 
-Visit the app at:
-👉 http://127.0.0.1:5000
+## 📊 Results & Achievements  
 
-## 📊 Results & Achievements
+✅ Successfully generates adaptive quizzes from text, PDF, and web content.  
+✅ Tracks learner performance and adjusts future questions automatically.  
+✅ Provides a clean, responsive, and user-friendly web interface.  
+✅ Designed with a modular Flask + SQLite architecture for scalability.  
 
-### ✅ Successfully generates adaptive quizzes from text, PDF, and web content.
-### ✅ Tracks learner performance and adjusts future questions automatically.
-### ✅ Provides a clean, responsive, and user-friendly web interface.
-### ✅ Designed with a modular Flask + SQLite architecture for scalability.
+## 🔮 Future Enhancements  
 
-## 🔮 Future Enhancements
+🌐 Integration with OpenAI / Gemini APIs for enhanced NLP and content generation.  
+🗣️ Multilingual support for quizzes in multiple languages.  
+🎮 Gamified learning – badges, streaks, and leaderboards.  
+📈 Analytics dashboard – visualize progress and quiz statistics.  
+🧩 Image-based question extraction using OCR techniques.  
 
-🌐 Integration with OpenAI / Gemini APIs for enhanced NLP and content generation.
-🗣️ Multilingual support for quizzes in multiple languages.
-🎮 Gamified learning – badges, streaks, and leaderboards.
-📈 Analytics dashboard – visualize progress and quiz statistics.
-🧩 Image-based question extraction using OCR techniques.
+## 👩‍💻 Contributors  
 
-## 👩‍💻 Contributors
+## 🪪 License  
 
-## 🪪 License
-
-This project is open-source and available under the MIT License.
+This project is open-source and available under the MIT License.  
