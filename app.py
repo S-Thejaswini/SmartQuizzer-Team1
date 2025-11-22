@@ -15,6 +15,21 @@ from typing import List, Dict, Any, Optional
 import difflib
 import functools # [MODULE 6] For admin required decorator
 
+# Leaderboard & caching imports
+from dataclasses import dataclass
+from sqlalchemy import func
+from typing import Optional
+
+
+# Import cache helpers (new file)
+try:
+    from cache import cache_get, cache_set
+except Exception as e:
+    # If cache.py not present yet, fallback to no-cache
+    print(f"[WARN] cache helpers not available: {e}")
+    cache_get = lambda k: None
+    cache_set = lambda k, v: None
+
 # [MODULE 2] Import PDF/Text processing libraries
 # You will need to install these: pip install PyMuPDF requests beautifulsoup4
 try:
@@ -52,7 +67,7 @@ db = SQLAlchemy(app)
 def get_groq_client():
     api_key = os.getenv('GROQ_API_KEY')
     # This check ensures the key is not None AND is not the placeholder
-    if not api_key or api_key == 'your_groq_api_key here' or 'your-key-here' in api_key.lower():
+    if not api_key or api_key == '' or 'your-key-here' in api_key.lower():
          raise ValueError("GROQ_API_KEY not set correctly. Please create/check the .env file with your real Groq API key.")
     return Groq(api_key=api_key)
 
@@ -101,6 +116,8 @@ class Profile(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), unique=True, nullable=False)
     subjects_of_interest = db.Column(db.Text, nullable=True) # Stored as comma-separated string
+    
+    # This field now stores the *current adaptive difficulty*
     preferred_difficulty = db.Column(db.String(20), default='medium')
 
     # performance_history is derived from QuizAttempt and QuizAnswer models
@@ -123,6 +140,12 @@ class QuestionFeedback(db.Model):
     is_flagged = db.Column(db.Boolean, default=False) # e.g., "inappropriate/wrong"
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     is_resolved = db.Column(db.Boolean, default=False)
+
+
+class LeaderboardSnapshot(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    data_json = db.Column(db.Text)    
 
 
 # Create tables
@@ -299,6 +322,7 @@ def profile():
 
     if request.method == 'POST':
         profile.subjects_of_interest = request.form.get('subjects_of_interest', '').strip()
+        # This is the user's *preferred* difficulty, which now also acts as their *current* adaptive difficulty
         profile.preferred_difficulty = request.form.get('preferred_difficulty', 'medium')
         db.session.commit()
         flash('Profile updated successfully!', 'success')
@@ -307,6 +331,7 @@ def profile():
     # [MODULE 1] Get performance history
     attempts = QuizAttempt.query.filter_by(user_id=session['user_id']).order_by(QuizAttempt.completed_at.desc()).limit(10).all()
     history = [{
+        'id': a.id,
         'topic': a.topic,
         'score': a.score,
         'total': a.total_questions,
@@ -636,14 +661,25 @@ def generate_quiz():
     except (ValueError, TypeError):
          return jsonify({'success': False, 'message': 'Number of questions must be an integer.'}), 400
 
-    difficulty = str(data.get('difficulty', 'mixed')).lower().strip()
+    # --- MODIFICATION START ---
+    # Difficulty is no longer taken from the request payload.
+    # Instead, we load it from the user's profile.
+    
+    profile = Profile.query.filter_by(user_id=session['user_id']).first()
+    if not profile:
+        # This is a fallback, but shouldn't happen if register() is working
+        profile = Profile(user_id=session['user_id'], preferred_difficulty='medium')
+        db.session.add(profile)
+        db.session.commit()
+    
+    difficulty = profile.preferred_difficulty
+    print(f"[v1][INFO] Loaded user's current difficulty: {difficulty}")
+    
+    # --- MODIFICATION END ---
+
 
     # Validate num_questions range
     num_questions = min(max(num_questions, 5), 30) # Reduced max slightly for stability
-
-    # Validate difficulty
-    if difficulty not in ['easy', 'medium', 'hard', 'mixed']:
-        difficulty = 'mixed'
 
     # [MODULE 2] Check for context from uploaded material
     material_id = data.get('material_id') # Can be None or empty string
@@ -721,11 +757,16 @@ def generate_quiz():
             all_items = all_items[:num_questions]
 
         print(f"[v1][SUCCESS] Final generated quiz: {len(all_items)} questions for topic '{topic}'")
+        
+        # --- MODIFICATION START ---
+        # Return the difficulty level that was used to generate this quiz
         return jsonify({
             'success': True,
             'quiz': all_items,
-            'topic': topic # Return the final topic used (could be from material)
+            'topic': topic, # Return the final topic used (could be from material)
+            'difficulty': difficulty # <-- ADD THIS
         })
+        # --- MODIFICATION END ---
 
     except ValueError as ve: # Catch API key config errors from get_groq_client
        print(f"[v1][ERROR] Configuration error: {str(ve)}")
@@ -759,6 +800,8 @@ def save_attempt():
     score = data.get('score')
     total_questions = data.get('total_questions')
     answers = data.get('answers', []) # Expecting list of answer details from quiz.js
+
+    print(f"[DEBUG] save_attempt received: topic='{topic}', score={score}, total_questions={total_questions}, answers_count={len(answers)}")
 
     if not topic or score is None or total_questions is None or not isinstance(answers, list):
         print(f"[v1][ERROR] Invalid payload received in save_attempt: {data}")
@@ -819,8 +862,18 @@ def save_attempt():
                 continue # Skip this answer
 
         db.session.commit()
-        print(f"[v1][INFO] Saved attempt ID {attempt.id} with {saved_answers_count}/{len(answers)} answers for user {session['user_id']}.")
-        return jsonify({'success': True, 'message': 'Quiz attempt saved successfully.', 'attempt_id': attempt.id})
+
+        # vvv ADD THE SNIPPET HERE vvv
+        try:
+            # Invalidate the leaderboard cache so it regenerates
+            from cache import cache_delete
+            cache_delete('leaderboard_full')
+        except Exception as e:
+            print(f"[WARN] Could not invalidate leaderboard cache: {e}")
+        # ^^^ END OF SNIPPET ^^^
+        
+        print(f"[v1][INFO] Saved attempt ID {attempt.id} with {saved_answers_count}/{len(answers)} answers for user {session['user_id']}. Topic: '{topic}'")
+        return jsonify({'success': True, 'message': f'Quiz attempt saved successfully for topic: {topic}', 'attempt_id': attempt.id})
 
     except Exception as e:
         db.session.rollback() # Rollback the whole transaction on major error
@@ -895,6 +948,18 @@ def update_difficulty_endpoint():
     try:
         new_difficulty = update_difficulty(performance_history, current_difficulty)
 
+        # --- MODIFICATION START ---
+        # Save the new difficulty to the user's profile if it changed
+        if new_difficulty != current_difficulty:
+            profile = Profile.query.filter_by(user_id=session['user_id']).first()
+            if profile:
+                profile.preferred_difficulty = new_difficulty
+                db.session.commit()
+                print(f"[v1][INFO] User {session['user_id']} difficulty updated to {new_difficulty}")
+            else:
+                print(f"[v1][WARN] No profile found for user {session['user_id']} to save difficulty.")
+        # --- MODIFICATION END ---
+
         return jsonify({
             'success': True,
             'recommended_difficulty': new_difficulty,
@@ -935,6 +1000,212 @@ def recommend_type_endpoint():
         'success': True,
         'recommended_type': recommended_type
     })
+
+
+@dataclass
+class LeaderboardRow:
+    user_id: int
+    username: str
+    total_quizzes: int
+    total_questions: int
+    total_correct: int
+    accuracy: float
+    avg_score: float
+    last_active: Optional[datetime]
+    rank: int = 0
+
+
+def compute_leaderboard(limit: int = 50, offset: int = 0, min_attempts: int = 0) -> Dict[str, Any]:
+    """
+    Compute leaderboard rows (in-memory ranking) using aggregate quiz stats.
+    Returns dict with 'total' and 'rows' (list of LeaderboardRow).
+    """
+    # Aggregate per-user stats using SQL for performance
+    agg = db.session.query(
+        User.id.label('user_id'),
+        User.username.label('username'),
+        func.count(QuizAttempt.id).label('total_quizzes'),
+        func.coalesce(func.sum(QuizAttempt.total_questions), 0).label('total_questions'),
+        func.coalesce(func.sum(QuizAttempt.score), 0).label('total_correct'),
+        func.max(QuizAttempt.completed_at).label('last_active')
+    ).join(QuizAttempt, QuizAttempt.user_id == User.id).group_by(User.id)
+    
+    # Filter: minimum attempts if requested
+    if min_attempts > 0:
+        agg = agg.having(func.count(QuizAttempt.id) >= min_attempts)
+        
+    raw = agg.all()
+    
+    
+    rows: List[LeaderboardRow] = []
+    for r in raw:
+        tq = int(r.total_questions or 0)
+        tc = int(r.total_correct or 0)
+        accuracy = (tc / tq * 100.0) if tq > 0 else 0.0
+        avg_score = ((r.total_correct / r.total_quizzes) if r.total_quizzes and r.total_quizzes > 0 else 0.0)
+        rows.append(LeaderboardRow(
+            user_id=r.user_id,
+            username=r.username,
+            total_quizzes=int(r.total_quizzes or 0),
+            total_questions=tq,
+            total_correct=tc,
+            accuracy=round(accuracy, 2),
+            avg_score=round(avg_score, 2),
+            last_active=r.last_active
+        ))
+
+
+    # Sort by accuracy desc, then total_correct desc, then last_active desc
+    rows.sort(key=lambda x: (x.accuracy, x.total_correct, x.last_active or datetime.min), reverse=True)
+    
+    # Assign ranks; handle ties (same accuracy and same total_correct -> same rank)
+    rank = 0
+    prev_key = None
+    for i, r in enumerate(rows, start=1):
+        key = (r.accuracy, r.total_correct)
+        if key != prev_key:
+            rank = i
+            prev_key = key
+        r.rank = rank
+        
+    total = len(rows)
+    
+    # Pagination in python since we needed ranking across full list
+    paged = rows[offset: offset + limit]
+    return {'total': total, 'rows': paged}
+
+@app.route('/api/user-info')
+@login_required
+def api_user_info():
+    user = User.query.get(session['user_id'])
+    if not user:
+        return jsonify({'success': False}), 404
+    return jsonify({'success': True, 'id': user.id, 'username': user.username})
+
+
+
+@app.route('/api/leaderboard')
+@login_required
+def api_leaderboard():
+    try:
+        # --- ADD THIS BLOCK ---
+        page = int(request.args.get('page', 1))
+        per_page = min(max(int(request.args.get('per_page', 20)), 1), 50)
+        offset = (page - 1) * per_page
+        search = (request.args.get('search') or '').strip().lower()
+        min_attempts = int(request.args.get('min_attempts', 0))
+        # --- END OF BLOCK ---
+
+        # Try cache first
+        cache_key = 'leaderboard_full'
+        cached = None
+        try:
+            cached = cache_get(cache_key)
+        except Exception as e:
+            print(f"[WARN] cache_get failed: {e}")
+            cached = None
+
+        if cached:
+            rows_json = cached
+        else:
+            # Compute full leaderboard (no pagination) and cache serializable JSON
+            full = compute_leaderboard(limit=99999, offset=0, min_attempts=min_attempts)
+            rows = full['rows']
+            rows_json = []
+            for r in rows:
+                rows_json.append({
+                    'rank': r.rank,
+                    'user_id': r.user_id,
+                    'username': r.username,
+                    'total_quizzes': r.total_quizzes,
+                    'total_questions': r.total_questions,
+                    'total_correct': r.total_correct,
+                    'accuracy': r.accuracy,
+                    'avg_score_per_attempt': r.avg_score,
+                    'last_active': r.last_active.strftime('%Y-%m-%d %H:%M') if r.last_active else None
+                })
+            try:
+                cache_set(cache_key, rows_json)
+            except Exception as e:
+                print(f"[WARN] cache_set failed: {e}")
+
+        # Apply search filter (if requested)
+        if search:
+            rows_json = [r for r in rows_json if search in (r.get('username') or '').lower()]
+
+        total_filtered = len(rows_json)
+        paged = rows_json[offset: offset + per_page]
+
+        return jsonify({
+            'success': True,
+            'page': page,
+            'per_page': per_page,
+            'total': total_filtered,
+            'leaderboard': paged
+        })
+
+    except Exception as e:
+        print(f"[v1][ERROR] api_leaderboard: {e}")
+        import traceback; traceback.print_exc()
+        return jsonify({'success': False, 'message': 'Could not compute leaderboard.'}), 500
+
+
+
+@app.route('/leaderboard')
+@login_required
+def leaderboard_page():
+    try:
+        data = compute_leaderboard(limit=20, offset=0)
+        rows = data['rows']
+        rows_templ = [{
+            'rank': r.rank,
+            'user_id': r.user_id,
+            'username': r.username,
+            'total_quizzes': r.total_quizzes,
+            'total_questions': r.total_questions,
+            'total_correct': r.total_correct,
+            'accuracy': r.accuracy,
+            'avg_score_per_attempt': r.avg_score,
+            'last_active': r.last_active.strftime('%Y-%m-%d %H:%M') if r.last_active else 'N/A'
+        } for r in rows]
+        return render_template('leaderboard.html', rows=rows_templ, username=session.get('username'))
+    except Exception as e:
+        print(f"[v1][ERROR] leaderboard_page: {e}")
+        flash('Could not load leaderboard at this time.', 'danger')
+        return redirect(url_for('analytics'))
+    
+
+
+@app.route('/admin/cron/generate-leaderboard', methods=['POST'])
+@admin_required
+def cron_generate_leaderboard():
+    try:
+        full = compute_leaderboard(limit=99999)
+        rows = [{
+            'rank': r.rank,
+            'username': r.username,
+            'user_id': r.user_id,
+            'accuracy': r.accuracy,
+            'total_correct': r.total_correct,
+            'total_questions': r.total_questions,
+            'total_quizzes': r.total_quizzes
+        } for r in full['rows']]
+
+        snap = LeaderboardSnapshot(data_json=json.dumps(rows))
+        db.session.add(snap)
+        db.session.commit()
+
+        # Invalidate cache after snapshot
+        try:
+            cache_set('leaderboard_full', rows)
+        except Exception:
+            pass
+
+        return jsonify({'success': True, 'message': 'Leaderboard snapshot saved.'})
+    except Exception as e:
+        print("[CRON ERROR]", e)
+        import traceback; traceback.print_exc()
+        return jsonify({'success': False, 'message': str(e)}), 500
 
 
 # --- Helper functions ---
@@ -1020,6 +1291,7 @@ def extract_json_array(text: str) -> Optional[List[Dict[str, Any]]]:
         print(f"[v1][ERROR] extract_json_array: Final JSON parse failed: {e}. Candidate was: {candidate[:500]}...")
         return None
 
+
 def sanitize_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     sanitized: List[Dict[str, Any]] = []
     if not isinstance(items, list): # Basic check
@@ -1048,23 +1320,28 @@ def sanitize_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             # --- MCQ Single ---
             if question_type in ["mcq", "mcq_single"]:
                 options_raw = it.get("options")
-                if not isinstance(options_raw, list) or len(options_raw) < 2:
-                     print(f"[v1][WARN] sanitize_items: Skipping MCQ (single) item {item_index} due to invalid options: {options_raw}")
-                     continue
-                options = [str(o).strip() for o in options_raw if str(o).strip()][:4] # Max 4
-                if len(options) < 2: # Need at least two
-                     print(f"[v1][WARN] sanitize_items: Skipping MCQ (single) item {item_index} due to < 2 valid options.")
-                     continue
-                while len(options) < 4: options.append(f"Option {len(options)+1}") # Pad to 4
+                if not isinstance(options_raw, list):
+                    print(f"[v1][WARN] sanitize_items: Skipping MCQ (single) item {item_index} due to invalid options: {options_raw}")
+                    continue
+                
+                # --- FIX: Stricter Option Cleaning ---
+                # 1. Get all non-empty, non-placeholder options
+                options = [str(o).strip() for o in options_raw if str(o).strip() and not re.match(r'^(Option |Choice )[A-D1-4]$', str(o), re.IGNORECASE)]
+                
+                # 2. Check if we have exactly 4 valid options
+                if len(options) != 4:
+                    print(f"[v1][WARN] sanitize_items: Skipping MCQ (single) item {item_index} because it does not have 4 valid options. Found: {options}")
+                    continue
+                # --- END FIX ---
 
                 ca_raw = it.get("correct_answer")
                 ca = 0 # Default
                 try:
-                     ca = int(ca_raw)
+                    ca = int(ca_raw)
                 except (ValueError, TypeError):
                     if isinstance(ca_raw, str):
-                        try: ca = options.index(ca_raw.strip())
-                        except ValueError: ca = 0 # Fallback
+                         try: ca = options.index(ca_raw.strip())
+                         except ValueError: ca = 0 # Fallback
                     else: ca = 0 # Fallback
                 ca = max(0, min(len(options) - 1, ca)) # Clamp index
 
@@ -1078,14 +1355,17 @@ def sanitize_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             # --- MCQ Multiple ---
             elif question_type == "mcq_multiple":
                 options_raw = it.get("options")
-                if not isinstance(options_raw, list) or len(options_raw) < 2:
-                     print(f"[v1][WARN] sanitize_items: Skipping MCQ (multi) item {item_index} due to invalid options.")
-                     continue
-                options = [str(o).strip() for o in options_raw if str(o).strip()][:4] # Max 4
-                if len(options) < 2:
-                     print(f"[v1][WARN] sanitize_items: Skipping MCQ (multi) item {item_index} due to < 2 valid options.")
-                     continue
-                while len(options) < 4: options.append(f"Option {len(options)+1}")
+                if not isinstance(options_raw, list):
+                    print(f"[v1][WARN] sanitize_items: Skipping MCQ (multi) item {item_index} due to invalid options.")
+                    continue
+                
+                # --- FIX: Stricter Option Cleaning ---
+                options = [str(o).strip() for o in options_raw if str(o).strip() and not re.match(r'^(Option |Choice )[A-D1-4]$', str(o), re.IGNORECASE)]
+
+                if len(options) != 4:
+                    print(f"[v1][WARN] sanitize_items: Skipping MCQ (multi) item {item_index} because it does not have 4 valid options. Found: {options}")
+                    continue
+                # --- END FIX ---
 
                 ca_raw = it.get("correct_answer")
                 indices = []
@@ -1093,10 +1373,10 @@ def sanitize_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     for v in ca_raw:
                         try: idx = int(v)
                         except (ValueError, TypeError):
-                           if isinstance(v, str):
-                                try: idx = options.index(v.strip())
-                                except ValueError: continue # Ignore if text doesn't match
-                           else: continue # Ignore non-int, non-str in list
+                            if isinstance(v, str):
+                                 try: idx = options.index(v.strip())
+                                 except ValueError: continue # Ignore if text doesn't match
+                            else: continue # Ignore non-int, non-str in list
                         if 0 <= idx < len(options): indices.append(idx)
                 elif isinstance(ca_raw, (int, str)): # Handle single answer provided for multi
                     try: idx = int(ca_raw)
@@ -1109,8 +1389,8 @@ def sanitize_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
                 indices = sorted(list(set(indices))) # Dedupe and sort
                 if not indices: # Must have at least one correct answer
-                     print(f"[v1][WARN] sanitize_items: Skipping MCQ (multi) item {item_index} due to no valid correct answers.")
-                     continue
+                    print(f"[v1][WARN] sanitize_items: Skipping MCQ (multi) item {item_index} due to no valid correct answers.")
+                    continue
 
                 sanitized.append({
                     "question": question_text, "question_type": "mcq_multiple",
@@ -1132,8 +1412,8 @@ def sanitize_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     if ca_raw == 1: ca_bool = True
                     elif ca_raw == 0: ca_bool = False
                 if ca_bool is None:
-                     print(f"[v1][WARN] sanitize_items: Skipping T/F item {item_index} due to uninterpretable answer: {ca_raw}")
-                     continue
+                    print(f"[v1][WARN] sanitize_items: Skipping T/F item {item_index} due to uninterpretable answer: {ca_raw}")
+                    continue
 
                 sanitized.append({
                     "question": question_text, "question_type": "true_false",
@@ -1146,16 +1426,16 @@ def sanitize_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             elif question_type in ["short_answer", "fill_in_the_blank"]:
                 # Keep original type
                 if question_type == "fill_in_the_blank" and "___" not in question_text and "[BLANK]" not in question_text:
-                     print(f"[v1][WARN] sanitize_items: Item {item_index} 'fill_in_the_blank' lacks '___' or '[BLANK]'.")
+                    print(f"[v1][WARN] sanitize_items: Item {item_index} 'fill_in_the_blank' lacks '___' or '[BLANK]'.")
 
                 expected_raw = it.get("correct_answer")
                 if expected_raw is None:
-                     print(f"[v1][WARN] sanitize_items: Skipping {question_type} item {item_index} due to missing correct answer.")
-                     continue
+                    print(f"[v1][WARN] sanitize_items: Skipping {question_type} item {item_index} due to missing correct answer.")
+                    continue
                 expected = str(expected_raw).strip()
                 if not expected:
-                     print(f"[v1][WARN] sanitize_items: Skipping {question_type} item {item_index} due to empty correct answer.")
-                     continue
+                    print(f"[v1][WARN] sanitize_items: Skipping {question_type} item {item_index} due to empty correct answer.")
+                    continue
 
                 sanitized.append({
                     "question": question_text, "question_type": question_type, # Use original type
@@ -1172,17 +1452,6 @@ def sanitize_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             continue # Skip problematic item
     return sanitized
 
-def dedupe_by_question(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    seen = set()
-    result: List[Dict[str, Any]] = []
-    for it in items:
-        # Use a simplified version of the question text for deduplication
-        q_norm = normalize_text(it.get("question", "")) # Use global helper
-        if q_norm and q_norm not in seen:
-            seen.add(q_norm)
-            result.append(it)
-    return result
-
 def build_prompt(topic: str, count: int, difficulty: str, distribution: Dict[str, int], context: Optional[str] = None) -> str:
     difficulty_line = "" if difficulty == 'mixed' else f"Overall difficulty level should be around: {difficulty.capitalize()}.\n"
     context_line = ""
@@ -1198,7 +1467,7 @@ def build_prompt(topic: str, count: int, difficulty: str, distribution: Dict[str
 
     total_requested = mcq_s + mcq_m + tf + sa + fib
     if count > 0 and total_requested == 0:
-         mcq_s = count # Default to MCQ if distribution failed
+            mcq_s = count # Default to MCQ if distribution failed
 
     return f"""Please generate exactly {count} quiz questions about the topic "{topic}".
 {context_line}
@@ -1213,23 +1482,41 @@ Strictly adhere to the following distribution of question types:
 
 Each object in the JSON array must follow this exact schema:
 {{
-  "question": "The full text of the question?",
-  "question_type": "(must be one of: mcq_single, mcq_multiple, true_false, short_answer, fill_in_the_blank)",
-  "options": ["Option A", "Option B", "Option C", "Option D"],  // REQUIRED for mcq_single and mcq_multiple ONLY. Exactly 4 options.
-  "correct_answer": (value depends on question_type), // mcq_single: index (0-3), mcq_multiple: array of indices [1, 3], true_false: boolean (true/false), short_answer/fill_in_the_blank: string
-  "explanation": "A concise explanation (around 50-100 words) justifying the correct answer and explaining relevant concepts.",
-  "difficulty_level": "(must be one of: easy, medium, hard)" // Estimate difficulty.
+ "question": "The full text of the question? (For 'true_false', this MUST be a declarative statement.)",
+ "question_type": "(must be one of: mcq_single, mcq_multiple, true_false, short_answer, fill_in_the_blank)",
+ "options": ["Text for Choice 1", "Text for Choice 2", "Text for Choice 3", "Text for Choice 4"],  // REQUIRED for mcq types. MUST be 4 distinct, real options, not placeholders.
+ 
+  // vvv CHANGE IS HERE vvv
+ "correct_answer": (value depends on question_type), // mcq_single: **string** (e.g., "Paris"), mcq_multiple: **array of strings** (e.g., ["5", "7"]), true_false: boolean (true/false), short_answer: string
+  // ^^^ CHANGE IS HERE ^^^
+
+ "explanation": "A concise, 1-2 sentence, and 100% FACTUALLY ACCURATE explanation justifying the answer.",
+ "difficulty_level": "(must be one of: easy, medium, hard)" // Estimate difficulty.
 }}
 
 **Specific Rules:**
 1.  **JSON ONLY:** The entire response must be a single JSON array `[...]`.
 2.  **Schema Compliance:** Every field is mandatory (except 'options' for non-MCQ types).
-3.  **MCQ Options:** MCQs must have exactly 4 distinct string options.
-4.  **Fill-in-the-Blank:** The "question" text for "fill_in_the_blank" *must* contain a placeholder like '___' or '[BLANK]'.
-5.  **Correct Answers:** Ensure `correct_answer` format matches `question_type`. For `mcq_multiple`, provide an array even if only one answer is correct (e.g., `[2]`). For `true_false`, use actual booleans `true` or `false`.
-6.  **Explanations:** Provide clear and helpful explanations.
-7.  **Difficulty:** Assign a reasonable `easy`, `medium`, or `hard` level. {difficulty_line}
-8.  **Context:** If context was provided, base questions *strictly* on that text.
+3.  **MCQ Options:** MUST provide 4 distinct, meaningful options. **DO NOT use placeholders** like "Option A" or "Text for Choice 1".
+4.  **Fill-in-the-Blank:** The "question" text *must* contain a placeholder like '___' or '[BLANK]'.
+ 
+ // vvv CHANGE IS HERE vvv
+5.  **Correct Answers (CRITICAL!):** The format MUST match question_type.
+    - For `mcq_single`: Provide the **exact string** of the correct option (e.g., "Au"). **DO NOT provide a numeric index.**
+    - For `mcq_multiple`: Provide an **array of the exact strings** of the correct options (e.g., ["Leaves"]). **DO NOT provide numeric indices.**
+    - For `true_false`: Use actual booleans `true` or `false`.
+    - For `short_answer`/`fill_in_the_blank`: Provide the expected answer string.
+ // ^^^ CHANGE IS HERE ^^^
+
+6.  **True/False Rule:** For "true_false" questions, the "question" field MUST be a declarative statement. (e.g., "The capital of France is Paris.") NOT an interrogative question (e.g., "What is the capital of France?").
+7.  **Explanations:** MUST be **factually correct** and relevant to the question. **Double-check your facts.**
+ 
+ // vvv CHANGE IS HERE vvv
+8.  **Consistency:** The "explanation" field *must* directly and factually support the answer(s) provided in the "correct_answer" field. (e.g., If `correct_answer` is "Au", the `explanation` *must* explain why "Au" is correct.)
+ // ^^^ CHANGE IS HERE ^^^
+
+9.  **Difficulty:** Assign a reasonable `easy`, `medium`, or `hard` level. {difficulty_line}
+10. **Context:** If context was provided, base questions *strictly* on that text.
 
 Generate the JSON array now.
 """
@@ -1281,6 +1568,20 @@ def similarity(a: str, b: str) -> float:
 # --- End Helper Functions ---
 
 
+# --- THIS IS THE MISSING FUNCTION ---
+def dedupe_by_question(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen = set()
+    result: List[Dict[str, Any]] = []
+    for it in items:
+        # Use a simplified version of the question text for deduplication
+        q_norm = normalize_text(it.get("question", "")) # Use global helper
+        if q_norm and q_norm not in seen:
+            seen.add(q_norm)
+            result.append(it)
+    return result
+
+
+# --- CORRECTED evaluate_answer function ---
 def evaluate_answer(question: Dict[str, Any], user_answer: Any) -> Dict[str, Any]:
     """
     Evaluates the user's answer against the correct answer.
@@ -1315,40 +1616,41 @@ def evaluate_answer(question: Dict[str, Any], user_answer: Any) -> Dict[str, Any
                 result['is_correct'] = True
                 result['feedback'] = "Correct!"
             elif 0 <= correct_index < len(options):
-                 result['feedback'] = f"Incorrect. The correct answer was {chr(65 + correct_index)}: {options[correct_index]}"
+                result['feedback'] = f"Incorrect. The correct answer was {chr(65 + correct_index)}: {options[correct_index]}"
             else:
-                 result['feedback'] = "Incorrect. Could not determine the correct option."
+                result['feedback'] = "Incorrect. Could not determine the correct option."
 
         # --- MCQ Multiple Choice ---
         elif question_type == 'mcq_multiple':
-             options = question.get('options', [])
-             user_indices = []
-             if isinstance(user_answer, list):
-                 for ans in user_answer:
-                     try: idx = int(ans);
-                     except (ValueError, TypeError): continue
-                     if 0 <= idx < len(options): user_indices.append(idx)
-             user_indices = sorted(list(set(user_indices)))
-             result['user_answer_parsed'] = user_indices
+            options = question.get('options', [])
+            user_indices = []
+            if isinstance(user_answer, list):
+                for ans in user_answer:
+                    try: idx = int(ans);
+                    except (ValueError, TypeError): continue
+                    if 0 <= idx < len(options): user_indices.append(idx)
+            user_indices = sorted(list(set(user_indices)))
+            result['user_answer_parsed'] = user_indices
 
-             correct_indices = []
-             if isinstance(correct_answer, list):
-                 for ans in correct_answer:
-                      try: idx = int(ans)
-                      except (ValueError, TypeError): continue
-                      if 0 <= idx < len(options): correct_indices.append(idx)
-             correct_indices = sorted(list(set(correct_indices)))
-             result['correct_answer'] = correct_indices
+            correct_indices = []
+            if isinstance(correct_answer, list):
+                for ans in correct_answer:
+                    try: idx = int(ans)
+                    except (ValueError, TypeError): continue
+                    if 0 <= idx < len(options): correct_indices.append(idx)
+            correct_indices = sorted(list(set(correct_indices)))
+            result['correct_answer'] = correct_indices
 
-             if user_indices == correct_indices and correct_indices:
-                 result['is_correct'] = True
-                 result['feedback'] = "Correct!"
-             else:
-                 pretty_correct = ', '.join(chr(65 + i) for i in correct_indices)
-                 result['feedback'] = f"Incorrect. The correct option(s) were: {pretty_correct}" if pretty_correct else "Incorrect."
+            if user_indices == correct_indices and correct_indices:
+                result['is_correct'] = True
+                result['feedback'] = "Correct!"
+            else:
+                pretty_correct = ', '.join(chr(65 + i) for i in correct_indices)
+                result['feedback'] = f"Incorrect. The correct option(s) were: {pretty_correct}" if pretty_correct else "Incorrect."
 
         # --- True/False ---
         elif question_type == 'true_false':
+            # Parse the user's answer (robust)
             user_bool = None
             if isinstance(user_answer, bool): user_bool = user_answer
             elif isinstance(user_answer, str):
@@ -1357,29 +1659,39 @@ def evaluate_answer(question: Dict[str, Any], user_answer: Any) -> Dict[str, Any
                 elif user_str in ['false', 'f', '0', 'no']: user_bool = False
             result['user_answer_parsed'] = user_bool
 
+            # Parse the correct answer (robust)
             correct_bool = None
-            if isinstance(correct_answer, bool): correct_bool = correct_answer
+            if isinstance(correct_answer, bool): 
+                correct_bool = correct_answer
             elif isinstance(correct_answer, str):
-                 correct_str = correct_answer.strip().lower()
-                 if correct_str == 'true': correct_bool = True
-                 elif correct_str == 'false': correct_bool = False
+                correct_str = correct_answer.strip().lower()
+                if correct_str in ['true', 't', '1', 'yes', 'correct']: 
+                    correct_bool = True
+                elif correct_str in ['false', 'f', '0', 'no', 'incorrect']: 
+                    correct_bool = False
             elif isinstance(correct_answer, int):
-                 correct_bool = (correct_answer == 1)
-            result['correct_answer'] = correct_bool
+                if correct_answer == 1: 
+                    correct_bool = True
+                elif correct_answer == 0: 
+                    correct_bool = False
+            
+            result['correct_answer'] = correct_bool # Store the cleaned boolean
 
             if user_bool == correct_bool and correct_bool is not None:
                 result['is_correct'] = True
                 result['feedback'] = "Correct!"
             elif correct_bool is not None:
-                 result['feedback'] = f"Incorrect. The correct answer was: {'True' if correct_bool else 'False'}"
+                result['feedback'] = f"Incorrect. The correct answer was: {'True' if correct_bool else 'False'}"
             else:
-                 result['feedback'] = "Incorrect. Could not determine correct answer."
+                # This happens if the AI's answer was unreadable
+                print(f"[v1][ERROR] evaluate_answer: Could not parse T/F correct_answer: {correct_answer}")
+                result['feedback'] = "Incorrect. Could not determine correct answer."
 
         # --- Short Answer & Fill in the Blank ---
         elif question_type in ['short_answer', 'fill_in_the_blank']:
             # Uses GLOBAL helper functions
             if not isinstance(user_answer, str) or correct_answer is None:
-                 result['feedback'] = f"Incorrect. Expected text. Correct: {correct_answer}"
+                result['feedback'] = f"Incorrect. Expected text. Correct: {correct_answer}"
             else:
                 user_norm = normalize_text(user_answer)
                 correct_norm = normalize_text(str(correct_answer))
@@ -1404,6 +1716,7 @@ def evaluate_answer(question: Dict[str, Any], user_answer: Any) -> Dict[str, Any
        print(f"[v1][ERROR] Exception during evaluate_answer: {e}")
        result['feedback'] = f"An error occurred during evaluation: {e}"
        result['is_correct'] = False # Ensure correctness is false on error
+       import traceback; traceback.print_exc()
 
     return result
 
@@ -1549,15 +1862,56 @@ def analytics_summary():
 def analytics_attempts():
     user_id = session['user_id']
     try:
-        attempts = QuizAttempt.query.filter_by(user_id=user_id).order_by(QuizAttempt.completed_at.desc()).limit(20).all()
+        # Query params
+        page = int(request.args.get('page', 1))
+        per_page = min(max(int(request.args.get('per_page', 20)), 1), 50)
+        sort_by = (request.args.get('sort_by') or 'date').lower()
+        order = (request.args.get('order') or 'desc').lower()
+        topic_filter = (request.args.get('topic') or '').strip()
+
+        query = QuizAttempt.query.filter_by(user_id=user_id)
+
+        if topic_filter:
+            query = query.filter(QuizAttempt.topic.ilike(f"%{topic_filter}%"))
+
+        # Sorting
+        if sort_by in ['topic', 'score', 'total_questions']:
+            sort_col = getattr(QuizAttempt, sort_by)
+        elif sort_by in ['percentage', 'grade']:
+            # derive via score/total; fallback to date order after fetching
+            sort_col = QuizAttempt.completed_at
+        else:
+            # date
+            sort_col = QuizAttempt.completed_at
+
+        sort_col = sort_col.desc() if order == 'desc' else sort_col.asc()
+        base_query = query.order_by(sort_col)
+
+        total = base_query.count()
+        items = base_query.offset((page - 1) * per_page).limit(per_page).all()
+
         attempts_data = []
-        for attempt in attempts:
+        for attempt in items:
             percentage = round((attempt.score / attempt.total_questions * 100) if attempt.total_questions > 0 else 0, 1)
             attempts_data.append({
-                'id': attempt.id, 'topic': attempt.topic, 'score': attempt.score, 'total_questions': attempt.total_questions,
-                'percentage': percentage, 'completed_at': attempt.completed_at.strftime('%Y-%m-%d %H:%M'), 'grade': get_grade(percentage)
+                'id': attempt.id,
+                'topic': attempt.topic,
+                'score': attempt.score,
+                'total_questions': attempt.total_questions,
+                'percentage': percentage,
+                'completed_at': attempt.completed_at.strftime('%Y-%m-%d %H:%M'),
+                'grade': get_grade(percentage)
             })
-        return jsonify({'success': True, 'attempts': attempts_data})
+
+        # If sorting by derived fields, sort in-memory
+        if sort_by == 'percentage':
+            attempts_data.sort(key=lambda a: a['percentage'], reverse=(order == 'desc'))
+        if sort_by == 'grade':
+            # Grade order A+, A, B, C, D, F
+            grade_rank = {'A+': 6, 'A': 5, 'B': 4, 'C': 3, 'D': 2, 'F': 1}
+            attempts_data.sort(key=lambda a: grade_rank.get(a['grade'], 0), reverse=(order == 'desc'))
+
+        return jsonify({'success': True, 'attempts': attempts_data, 'page': page, 'per_page': per_page, 'total': total})
     except Exception as e:
         print(f"[v1][ERROR] Error in analytics_attempts: {e}"); return jsonify({'success': False, 'message': 'Could not load recent attempts.'}), 500
 
@@ -1641,6 +1995,55 @@ def analytics_charts():
     except Exception as e:
         print(f"[v1][ERROR] Error in analytics_charts: {e}"); return jsonify({'success': False, 'message': 'Could not load chart data.'}), 500
 
+@app.route('/api/quiz-attempt/<int:attempt_id>')
+@login_required
+def get_quiz_attempt_details(attempt_id):
+    user_id = session['user_id']
+    try:
+        # Verify the attempt belongs to the current user
+        attempt = QuizAttempt.query.filter_by(id=attempt_id, user_id=user_id).first()
+        if not attempt:
+            return jsonify({'success': False, 'message': 'Quiz attempt not found.'}), 404
+        
+        # Get all answers for this attempt
+        answers = QuizAnswer.query.filter_by(attempt_id=attempt_id).order_by(QuizAnswer.id).all()
+        questions_data = []
+        
+        for answer in answers:
+            try:
+                options = json.loads(answer.options_json) if answer.options_json else None
+                correct_answer = json.loads(answer.correct_answer_json) if answer.correct_answer_json is not None else None
+                user_answer = json.loads(answer.user_answer_json) if answer.user_answer_json is not None else None
+            except (json.JSONDecodeError, TypeError): 
+                options, correct_answer, user_answer = "Error", "Error", "Error"
+
+            questions_data.append({
+                'question_text': answer.question_text,
+                'question_type': answer.question_type,
+                'options': options,
+                'correct_answer': correct_answer,
+                'user_answer': user_answer,
+                'is_correct': answer.is_correct,
+                'explanation': answer.explanation,
+                'time_spent': answer.time_spent_seconds
+            })
+        
+        return jsonify({
+            'success': True, 
+            'attempt': {
+                'id': attempt.id,
+                'topic': attempt.topic,
+                'score': attempt.score,
+                'total_questions': attempt.total_questions,
+                'percentage': round((attempt.score / attempt.total_questions) * 100, 1) if attempt.total_questions > 0 else 0,
+                'completed_at': attempt.completed_at.strftime('%Y-%m-%d %H:%M'),
+                'questions': questions_data
+            }
+        })
+    except Exception as e: 
+        print(f"[ERROR] Error getting quiz attempt details: {e}")
+        return jsonify({'success': False, 'message': 'Could not load quiz attempt details.'}), 500
+
 @app.route('/api/analytics/all-questions')
 @login_required
 def analytics_all_questions():
@@ -1662,7 +2065,7 @@ def analytics_all_questions():
              })
          return jsonify({'success': True, 'total_questions': len(questions_data), 'questions': questions_data})
      except Exception as e:
-        print(f"[v1][ERROR] Error in analytics_all_questions: {e}"); return jsonify({'success': False, 'message': 'Could not load all questions data.'}), 500
+         print(f"[v1][ERROR] Error in analytics_all_questions: {e}"); return jsonify({'success': False, 'message': 'Could not load all questions data.'}), 500
 
 # --- AI Feedback Route ---
 @app.route('/api/generate-feedback', methods=['POST'])
@@ -1887,6 +2290,53 @@ def feedback_details(feedback_id):
         print(f"[ADMIN][ERROR] Error getting feedback details: {e}")
         return jsonify({'error': 'Error retrieving feedback details'}), 500
 
+@app.route('/admin/material-details/<int:material_id>')
+@admin_required
+def material_details(material_id):
+    try:
+        material = LearningMaterial.query.get(material_id)
+        if material:
+            return jsonify({
+                'success': True,
+                'material': {
+                    'id': material.id,
+                    'title': material.title,
+                    'content': material.content,
+                    'material_type': material.material_type,
+                    'created_at': material.created_at.strftime('%Y-%m-%d %H:%M'),
+                    'user_id': material.user_id
+                }
+            })
+        else:
+            return jsonify({'success': False, 'message': 'Material not found.'}), 404
+    except Exception as e: 
+        print(f"[ADMIN][ERROR] Error getting material details: {e}")
+        return jsonify({'success': False, 'message': 'Error retrieving material details.'}), 500
+
+@app.route('/admin/update-material/<int:material_id>', methods=['PUT'])
+@admin_required
+def update_material(material_id):
+    try:
+        material = LearningMaterial.query.get(material_id)
+        if not material:
+            return jsonify({'success': False, 'message': 'Material not found.'}), 404
+        
+        data = request.get_json()
+        if not data:
+            return jsonify({'success': False, 'message': 'No data provided.'}), 400
+        
+        # Update material fields
+        material.title = data.get('title', material.title)
+        material.content = data.get('content', material.content)
+        material.material_type = data.get('material_type', material.material_type)
+        
+        db.session.commit()
+        return jsonify({'success': True, 'message': 'Material updated successfully.'})
+    except Exception as e: 
+        print(f"[ADMIN][ERROR] Error updating material: {e}")
+        db.session.rollback()
+        return jsonify({'success': False, 'message': 'Error updating material.'}), 500
+
 @app.route('/admin/delete-material/<int:material_id>', methods=['DELETE'])
 @admin_required
 def delete_material(material_id):
@@ -1939,6 +2389,312 @@ def export_analytics():
         print(f"[ADMIN][ERROR] Error exporting analytics: {e}")
         return jsonify({'success': False, 'message': 'Error exporting analytics.'}), 500
 
+# --- Enhanced Feedback Management Routes ---
+@app.route('/admin/feedback-list')
+@admin_required
+def feedback_list():
+    try:
+        feedback_items = QuestionFeedback.query.filter_by(is_resolved=False).order_by(QuestionFeedback.created_at.desc()).all()
+        feedback_data = []
+        for item in feedback_items:
+            feedback_data.append({
+                'id': item.id,
+                'user_id': item.user_id,
+                'question_text': item.question_text,
+                'feedback_text': item.feedback_text,
+                'is_flagged': item.is_flagged,
+                'created_at': item.created_at.strftime('%Y-%m-%d %H:%M')
+            })
+        return jsonify({'success': True, 'feedback_items': feedback_data})
+    except Exception as e:
+        print(f"[ADMIN][ERROR] Error fetching feedback list: {e}")
+        return jsonify({'success': False, 'message': 'Error fetching feedback list.'}), 500
+
+@app.route('/admin/flag-feedback/<int:feedback_id>', methods=['POST'])
+@admin_required
+def flag_feedback(feedback_id):
+    try:
+        feedback = QuestionFeedback.query.get(feedback_id)
+        if feedback:
+            feedback.is_flagged = True
+            db.session.commit()
+            return jsonify({'success': True, 'message': 'Feedback flagged successfully.'})
+        else:
+            return jsonify({'success': False, 'message': 'Feedback not found.'}), 404
+    except Exception as e:
+        print(f"[ADMIN][ERROR] Error flagging feedback: {e}")
+        return jsonify({'success': False, 'message': 'Error flagging feedback.'}), 500
+
+@app.route('/admin/unflag-feedback/<int:feedback_id>', methods=['POST'])
+@admin_required
+def unflag_feedback(feedback_id):
+    try:
+        feedback = QuestionFeedback.query.get(feedback_id)
+        if feedback:
+            feedback.is_flagged = False
+            db.session.commit()
+            return jsonify({'success': True, 'message': 'Flag removed successfully.'})
+        else:
+            return jsonify({'success': False, 'message': 'Feedback not found.'}), 404
+    except Exception as e:
+        print(f"[ADMIN][ERROR] Error removing flag: {e}")
+        return jsonify({'success': False, 'message': 'Error removing flag.'}), 500
+
+# Test route to create sample flagged feedback
+@app.route('/admin/create-test-flagged-feedback', methods=['POST'])
+@admin_required
+def create_test_flagged_feedback():
+    try:
+        # Create some test flagged feedback
+        test_feedback = [
+            QuestionFeedback(
+                user_id=1,
+                question_text="This is a test flagged question with inappropriate content",
+                feedback_text="This question contains offensive language and should be removed immediately.",
+                is_flagged=True,
+                is_resolved=False,
+                created_at=datetime.now()
+            ),
+            QuestionFeedback(
+                user_id=2,
+                question_text="Another flagged question with spam content",
+                feedback_text="This appears to be spam and should be flagged for review.",
+                is_flagged=True,
+                is_resolved=False,
+                created_at=datetime.now() - timedelta(hours=2)
+            ),
+            QuestionFeedback(
+                user_id=3,
+                question_text="Normal question without issues",
+                feedback_text="This is regular feedback that should not be flagged.",
+                is_flagged=False,
+                is_resolved=False,
+                created_at=datetime.now() - timedelta(hours=1)
+            )
+        ]
+        
+        for feedback in test_feedback:
+            db.session.add(feedback)
+        
+        db.session.commit()
+        return jsonify({'success': True, 'message': 'Test flagged feedback created successfully.'})
+    except Exception as e:
+        print(f"[ADMIN][ERROR] Error creating test feedback: {e}")
+        return jsonify({'success': False, 'message': 'Error creating test feedback.'}), 500
+
+# Debug route to check feedback status
+@app.route('/admin/debug-feedback')
+@admin_required
+def debug_feedback():
+    try:
+        all_feedback = QuestionFeedback.query.all()
+        flagged_feedback = QuestionFeedback.query.filter_by(is_flagged=True).all()
+        unresolved_feedback = QuestionFeedback.query.filter_by(is_resolved=False).all()
+        
+        debug_info = {
+            'total_feedback': len(all_feedback),
+            'flagged_feedback': len(flagged_feedback),
+            'unresolved_feedback': len(unresolved_feedback),
+            'flagged_items': [
+                {
+                    'id': item.id,
+                    'user_id': item.user_id,
+                    'question_text': item.question_text[:50] + '...',
+                    'feedback_text': item.feedback_text[:50] + '...',
+                    'is_flagged': item.is_flagged,
+                    'is_resolved': item.is_resolved,
+                    'created_at': item.created_at.strftime('%Y-%m-%d %H:%M')
+                }
+                for item in flagged_feedback
+            ]
+        }
+        
+        return jsonify({'success': True, 'debug_info': debug_info})
+    except Exception as e:
+        print(f"[ADMIN][ERROR] Error in debug feedback: {e}")
+        return jsonify({'success': False, 'message': 'Error in debug feedback.'}), 500
+
+# --- User Management Routes ---
+@app.route('/admin/user-details/<int:user_id>')
+@admin_required
+def user_details(user_id):
+    try:
+        user = User.query.get(user_id)
+        if user:
+            # Get user statistics
+            total_quizzes = QuizAttempt.query.filter_by(user_id=user_id).count()
+            total_materials = LearningMaterial.query.filter_by(user_id=user_id).count()
+            total_feedback = QuestionFeedback.query.filter_by(user_id=user_id).count()
+            
+            # Calculate average score
+            avg_score = 0
+            if total_quizzes > 0:
+                quiz_scores = db.session.query(QuizAttempt.score, QuizAttempt.total_questions).filter_by(user_id=user_id).all()
+                if quiz_scores:
+                    total_percentage = sum((score / total) * 100 for score, total in quiz_scores if total > 0)
+                    avg_score = round(total_percentage / len(quiz_scores), 1)
+            
+            return jsonify({
+                'success': True,
+                'user': {
+                    'id': user.id,
+                    'username': user.username,
+                    'email': user.email,
+                    'is_admin': user.is_admin,
+                    'created_at': user.created_at.strftime('%Y-%m-%d %H:%M'),
+                    'total_quizzes': total_quizzes,
+                    'total_materials': total_materials,
+                    'total_feedback': total_feedback,
+                    'avg_score': avg_score
+                }
+            })
+        else:
+            return jsonify({'success': False, 'message': 'User not found.'}), 404
+    except Exception as e: 
+        print(f"[ADMIN][ERROR] Error getting user details: {e}")
+        return jsonify({'success': False, 'message': 'Error retrieving user details.'}), 500
+
+@app.route('/admin/update-user/<int:user_id>', methods=['PUT'])
+@admin_required
+def update_user(user_id):
+    try:
+        user = User.query.get(user_id)
+        if not user:
+            return jsonify({'success': False, 'message': 'User not found.'}), 404
+        
+        data = request.get_json()
+        if not data:
+            return jsonify({'success': False, 'message': 'No data provided.'}), 400
+        
+        # Check if username or email already exists (excluding current user)
+        if 'username' in data and data['username'] != user.username:
+            existing_user = User.query.filter(User.username == data['username'], User.id != user_id).first()
+            if existing_user:
+                return jsonify({'success': False, 'message': 'Username already exists.'}), 400
+        
+        if 'email' in data and data['email'] != user.email:
+            existing_user = User.query.filter(User.email == data['email'], User.id != user_id).first()
+            if existing_user:
+                return jsonify({'success': False, 'message': 'Email already exists.'}), 400
+        
+        # Update user fields
+        if 'username' in data:
+            user.username = data['username']
+        if 'email' in data:
+            user.email = data['email']
+        if 'is_admin' in data:
+            user.is_admin = bool(data['is_admin'])
+        if 'password' in data and data['password'].strip():
+            user.password = generate_password_hash(data['password'])
+        
+        db.session.commit()
+        return jsonify({'success': True, 'message': 'User updated successfully.'})
+    except Exception as e: 
+        print(f"[ADMIN][ERROR] Error updating user: {e}")
+        db.session.rollback()
+        return jsonify({'success': False, 'message': 'Error updating user.'}), 500
+
+@app.route('/admin/user-statistics')
+@admin_required
+def user_statistics():
+    try:
+        # Overall statistics
+        total_users = User.query.count()
+        admin_users = User.query.filter_by(is_admin=True).count()
+        total_quizzes = QuizAttempt.query.count()
+        
+        # Calculate average score across all users
+        avg_score = 0
+        if total_quizzes > 0:
+            quiz_scores = db.session.query(QuizAttempt.score, QuizAttempt.total_questions).all()
+            if quiz_scores:
+                total_percentage = sum((score / total) * 100 for score, total in quiz_scores if total > 0)
+                avg_score = round(total_percentage / len(quiz_scores), 1)
+        
+        # Recent users
+        recent_users = User.query.order_by(User.created_at.desc()).limit(10).all()
+        recent_users_data = [{
+            'username': user.username,
+            'created_at': user.created_at.strftime('%Y-%m-%d %H:%M')
+        } for user in recent_users]
+        
+        return jsonify({
+            'success': True,
+            'stats': {
+                'total_users': total_users,
+                'admin_users': admin_users,
+                'total_quizzes': total_quizzes,
+                'avg_score': avg_score,
+                'recent_users': recent_users_data
+            }
+        })
+    except Exception as e: 
+        print(f"[ADMIN][ERROR] Error getting user statistics: {e}")
+        return jsonify({'success': False, 'message': 'Error retrieving user statistics.'}), 500
+
+@app.route('/admin/user-statistics/<int:user_id>')
+@admin_required
+def user_statistics_single(user_id):
+    try:
+        user = User.query.get(user_id)
+        if not user:
+            return jsonify({'success': False, 'message': 'User not found.'}), 404
+        
+        # Get user-specific statistics
+        total_quizzes = QuizAttempt.query.filter_by(user_id=user_id).count()
+        total_materials = LearningMaterial.query.filter_by(user_id=user_id).count()
+        total_feedback = QuestionFeedback.query.filter_by(user_id=user_id).count()
+        
+        # Calculate average score
+        avg_score = 0
+        if total_quizzes > 0:
+            quiz_scores = db.session.query(QuizAttempt.score, QuizAttempt.total_questions).filter_by(user_id=user_id).all()
+            if quiz_scores:
+                total_percentage = sum((score / total) * 100 for score, total in quiz_scores if total > 0)
+                avg_score = round(total_percentage / len(quiz_scores), 1)
+        
+        return jsonify({
+            'success': True,
+            'stats': {
+                'total_quizzes': total_quizzes,
+                'total_materials': total_materials,
+                'total_feedback': total_feedback,
+                'avg_score': avg_score
+            }
+        })
+    except Exception as e: 
+        print(f"[ADMIN][ERROR] Error getting user statistics: {e}")
+        return jsonify({'success': False, 'message': 'Error retrieving user statistics.'}), 500
+
+@app.route('/admin/export-user-statistics')
+@admin_required
+def export_user_statistics():
+    try:
+        # Get overall statistics
+        total_users = User.query.count()
+        admin_users = User.query.filter_by(is_admin=True).count()
+        total_quizzes = QuizAttempt.query.count()
+        
+        # Calculate average score
+        avg_score = 0
+        if total_quizzes > 0:
+            quiz_scores = db.session.query(QuizAttempt.score, QuizAttempt.total_questions).all()
+            if quiz_scores:
+                total_percentage = sum((score / total) * 100 for score, total in quiz_scores if total > 0)
+                avg_score = round(total_percentage / len(quiz_scores), 1)
+        
+        stats_data = {
+            'total_users': total_users,
+            'admin_users': admin_users,
+            'total_quizzes': total_quizzes,
+            'avg_score': avg_score
+        }
+        
+        return jsonify({'success': True, 'stats': stats_data})
+    except Exception as e: 
+        print(f"[ADMIN][ERROR] Error exporting user statistics: {e}")
+        return jsonify({'success': False, 'message': 'Error exporting user statistics.'}), 500
+
 # --- Demo Route ---
 @app.route('/api/demo-evaluate')
 def demo_evaluate():
@@ -1956,6 +2712,11 @@ def demo_evaluate():
     for ex in examples: ev = evaluate_answer(ex['q'], ex['ans']); fb = generate_feedback(ex['q'], ev); results.append({'case': ex['case'], 'eval': ev, 'fb': fb})
     return jsonify({'success': True, 'demo_results': results})
 
+
+@app.route('/contact')
+def contact():
+    """Contact page with full contact information"""
+    return render_template('contact.html')
 
 if __name__ == '__main__':
     # Set debug=False for production

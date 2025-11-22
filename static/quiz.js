@@ -1,4 +1,11 @@
 // --- static/quiz.js ---
+// Fully updated quiz.js with stable option IDs, robust highlighting/review,
+// defensive checks, and helpful debug logging.
+//
+// Notes:
+// - True/False inputs render with values "true"/"false" and getUserAnswer returns boolean.
+// - MCQ options use option.id when available, otherwise fallback to index string.
+// - highlightAnswers normalizes evaluation.correct_answer to strings when comparing.
 
 document.addEventListener('DOMContentLoaded', () => {
     // --- DOM Elements ---
@@ -18,8 +25,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const quizFooter = document.getElementById('quiz-footer');
     const submitAnswerBtn = document.getElementById('submit-answer');
     const nextQuestionBtn = document.getElementById('next-question');
-    const questionTypeDisplay = document.getElementById('question-type-display'); // Added
-    const mcqMultipleHint = document.getElementById('mcq-multiple-hint'); // <-- Ensure this is defined
+    const questionTypeDisplay = document.getElementById('question-type-display');
+    const mcqMultipleHint = document.getElementById('mcq-multiple-hint');
 
     // Feedback Container Elements
     const feedbackContainer = document.getElementById('feedback-container');
@@ -43,57 +50,51 @@ document.addEventListener('DOMContentLoaded', () => {
     const newQuizBtn = document.getElementById('new-quiz');
 
     // Flash Notification Element
-    const flashNotification = document.getElementById('flash-notification'); // Added
+    const flashNotification = document.getElementById('flash-notification');
 
     // --- Quiz State ---
     let quizData = [];
     let currentQuestionIndex = 0;
     let score = 0;
-    let performanceHistory = []; // List of booleans (correct/incorrect)
-    let currentDifficulty = 'medium'; // Default, will be updated
-    let answeredQuestions = []; // Stores {question, userAnswer, evaluation, feedback, timeSpent}
+    let performanceHistory = [];
+    let currentDifficulty = 'medium';
+    let answeredQuestions = [];
     let quizStartTime = null;
     let questionStartTime = null;
     let questionTimerInterval = null;
-    let flashTimeout = null; // For flash message timer
-    let totalQuizTime = 0; // Total time spent on quiz
-    let questionTimes = []; // Array to store time spent on each question
+    let flashTimeout = null;
+    let totalQuizTime = 0;
+    let questionTimes = [];
 
     // --- Initial Setup ---
     if (quizSetup) {
-        quizSetup.style.display = 'block'; // Show setup form initially
-        setupForm?.addEventListener('submit', startQuiz); // Add null check
+        quizSetup.style.display = 'block';
+        setupForm?.addEventListener('submit', startQuiz);
     } else {
         console.error("Quiz setup form not found!");
     }
-    // Add null checks for buttons before adding listeners
+
     submitAnswerBtn?.addEventListener('click', handleSubmitAnswer);
     nextQuestionBtn?.addEventListener('click', loadNextQuestion);
     questionFeedbackForm?.addEventListener('submit', submitQuestionFeedback);
     retryQuizBtn?.addEventListener('click', () => window.location.reload());
     newQuizBtn?.addEventListener('click', () => window.location.href = '/');
 
-
     // --- 1. Start Quiz ---
     async function startQuiz(e) {
         e.preventDefault();
-        if (!quizSetup || !quizLoading) return; // Safety check
+        if (!quizSetup || !quizLoading) return;
 
         quizSetup.style.display = 'none';
         quizLoading.style.display = 'block';
 
         const topicInput = document.getElementById('topic');
         const numQuestionsInput = document.getElementById('num_questions');
-        const difficultySelect = document.getElementById('difficulty');
         const materialIdInput = document.getElementById('material_id');
 
-        // Get values safely
         const topic = topicInput?.value || 'General Knowledge';
         const num_questions = numQuestionsInput?.value || '10';
-        const difficulty = difficultySelect?.value || 'medium';
         const material_id = materialIdInput?.value || '';
-
-        currentDifficulty = difficulty; // Set initial difficulty from user choice
 
         try {
             const response = await fetch('/api/generate-quiz', {
@@ -102,24 +103,34 @@ document.addEventListener('DOMContentLoaded', () => {
                 body: JSON.stringify({
                     topic: topic,
                     num_questions: parseInt(num_questions, 10),
-                    difficulty: difficulty,
                     material_id: material_id ? parseInt(material_id, 10) : null
                 })
             });
 
-            quizLoading.style.display = 'none'; // Hide loading regardless of success/failure after fetch
+            quizLoading.style.display = 'none';
 
             if (!response.ok) {
-                const errorData = await response.json();
-                throw new Error(errorData.message || `HTTP error! status: ${response.status}`);
+                // Attempt to read JSON, fallback to text
+                let errText = `HTTP status: ${response.status}`;
+                try {
+                    const errJson = await response.json();
+                    errText = errJson.message || JSON.stringify(errJson);
+                } catch (e) {
+                    try { errText = await response.text(); } catch(e2) {}
+                }
+                throw new Error(errText);
             }
 
             const data = await response.json();
             if (!data.success || !Array.isArray(data.quiz) || data.quiz.length === 0) {
-                 throw new Error(data.message || 'Received invalid quiz data from server.');
+                throw new Error(data.message || 'Received invalid quiz data from server.');
             }
 
             quizData = data.quiz;
+
+            // Use server-provided difficulty if available (fix bug)
+            currentDifficulty = data.difficulty || 'medium';
+            console.log("Quiz starting with difficulty:", currentDifficulty);
 
             // Reset state
             currentQuestionIndex = 0;
@@ -127,47 +138,49 @@ document.addEventListener('DOMContentLoaded', () => {
             performanceHistory = [];
             answeredQuestions = [];
             quizStartTime = new Date();
+            questionTimes = [];
 
             if (quizContainer) quizContainer.style.display = 'block';
             loadQuestion(currentQuestionIndex);
 
         } catch (error) {
             console.error('Error starting quiz:', error);
-            if (quizSetup) quizSetup.style.display = 'block'; // Show setup again on error
-            // Show error to user
-            alert(`Error generating quiz: ${error.message}\nPlease try again.`);
+            if (quizSetup) quizSetup.style.display = 'block';
+            showFlashMessage(`Error generating quiz: ${error.message}`, 'danger', 6000);
         }
     }
 
     // --- 2. Load Question ---
     function loadQuestion(index) {
+        // stop any running timer before changing question
+        stopQuestionTimer();
+
         if (!quizData || index >= quizData.length) {
             showResults(); return;
         }
 
         // Reset UI
-        if(feedbackContainer) feedbackContainer.style.display = 'none';
-        if(feedbackContainer) feedbackContainer.className = 'card';
-        if(questionFeedbackForm) questionFeedbackForm.reset();
-        if(feedbackAlert) feedbackAlert.style.display = 'none';
-        if(submitAnswerBtn) submitAnswerBtn.style.display = 'inline-block';
-        if(nextQuestionBtn) nextQuestionBtn.style.display = 'none';
-        if(submitAnswerBtn) submitAnswerBtn.disabled = false;
-        if(mcqMultipleHint) mcqMultipleHint.style.display = 'none'; // <-- Hide hint initially
+        if (feedbackContainer) { feedbackContainer.style.display = 'none'; feedbackContainer.className = 'card'; }
+        questionFeedbackForm?.reset();
+        if (feedbackAlert) feedbackAlert.style.display = 'none';
+        if (submitAnswerBtn) { submitAnswerBtn.style.display = 'inline-block'; submitAnswerBtn.disabled = false; }
+        if (nextQuestionBtn) nextQuestionBtn.style.display = 'none';
+        if (mcqMultipleHint) mcqMultipleHint.style.display = 'none';
 
         const question = quizData[index];
         if (!question || !questionText || !questionProgress || !currentScore || !questionTypeDisplay) {
-             console.error("Missing critical elements for loadQuestion."); return;
+            console.error("Missing critical elements for loadQuestion.");
+            return;
         }
 
         questionText.textContent = question.question || '[Missing Question]';
         questionProgress.textContent = `Question ${index + 1} of ${quizData.length}`;
         currentScore.textContent = `Score: ${score}`;
 
-        // Display Question Type
+        // Display Question Type (friendly)
         let displayType = 'Unknown';
         if (question.question_type) {
-             displayType = question.question_type
+            displayType = question.question_type
                 .replace('mcq_single', 'MCQ (Single)')
                 .replace('mcq_multiple', 'MCQ (Multiple)')
                 .replace('true_false', 'True/False')
@@ -176,15 +189,13 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         questionTypeDisplay.textContent = displayType;
 
-        // *** UPDATED HINT LOGIC ***
-        // Show hint only if type is mcq_multiple AND there's actually more than one correct answer
+        // Show hint for MCQ multiple only when multiple correct answers exist
         if (question.question_type === 'mcq_multiple' &&
             Array.isArray(question.correct_answer) &&
-            question.correct_answer.length > 1 && // Check length
-            mcqMultipleHint) { // Check variable exists
-                mcqMultipleHint.style.display = 'block'; // <-- Show hint
+            question.correct_answer.length > 1 &&
+            mcqMultipleHint) {
+            mcqMultipleHint.style.display = 'block';
         }
-        // *** END UPDATED HINT LOGIC ***
 
         renderAnswerOptions(question);
 
@@ -193,58 +204,83 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // --- 3. Render Answer Options ---
+    // Uses option.id when available, else falls back to index string.
+    // IMPORTANT: True/False options will have value "true" / "false" (strings),
+    // and getUserAnswer returns boolean for true_false questions.
     function renderAnswerOptions(question) {
         if (!answerOptions) return;
-        answerOptions.innerHTML = ''; // Clear previous options
+        answerOptions.innerHTML = '';
         const type = question.question_type;
 
-        try { // Add try block for safety
+        try {
             if (type === 'mcq_single' || type === 'true_false') {
-                const options = (type === 'true_false') ? ['True', 'False'] : (question.options || []);
-                if (options.length === 0 && type !== 'true_false') throw new Error("MCQ options missing");
-
-                options.forEach((option, index) => {
-                    const value = (type === 'true_false') ? (index === 0 ? 'true' : 'false') : index;
-                    const optionEl = document.createElement('div');
-                    optionEl.className = 'answer-option';
-                    optionEl.innerHTML = `
-                        <label>
-                            <input type="radio" name="answer" value="${value}">
-                            <span>${option || `Option ${index + 1}`}</span>
-                        </label>
-                    `;
-                    answerOptions.appendChild(optionEl);
-                });
+                // For true_false, render stable 'true'/'false' values.
+                if (type === 'true_false') {
+                    const tf = ['True', 'False'];
+                    tf.forEach((labelText, idx) => {
+                        const optId = idx === 0 ? 'true' : 'false';
+                        const optionEl = document.createElement('div');
+                        optionEl.className = 'answer-option';
+                        optionEl.setAttribute('data-option-id', optId);
+                        optionEl.innerHTML = `
+                            <label>
+                                <input type="radio" name="answer" value="${optId}" aria-label="${labelText}">
+                                <span>${labelText}</span>
+                            </label>
+                        `;
+                        answerOptions.appendChild(optionEl);
+                    });
+                } else {
+                    const options = question.options || [];
+                    if (options.length === 0) throw new Error("MCQ options missing");
+                    options.forEach((option, index) => {
+                        const optId = (typeof option === 'object' && option.id !== undefined) ? String(option.id) : String(index);
+                        const labelText = (typeof option === 'object' && option.label !== undefined) ? option.label : option;
+                        const optionEl = document.createElement('div');
+                        optionEl.className = 'answer-option';
+                        optionEl.setAttribute('data-option-id', optId);
+                        optionEl.innerHTML = `
+                            <label>
+                                <input type="radio" name="answer" value="${optId}" aria-label="${labelText}">
+                                <span>${labelText || `Option ${index + 1}`}</span>
+                            </label>
+                        `;
+                        answerOptions.appendChild(optionEl);
+                    });
+                }
             } else if (type === 'mcq_multiple') {
                 const options = question.options || [];
                 if (options.length < 2) throw new Error("MCQ Multiple needs at least 2 options");
 
                 options.forEach((option, index) => {
+                    const optId = (typeof option === 'object' && option.id !== undefined) ? String(option.id) : String(index);
+                    const labelText = (typeof option === 'object' && option.label !== undefined) ? option.label : option;
                     const optionEl = document.createElement('div');
                     optionEl.className = 'answer-option';
+                    optionEl.setAttribute('data-option-id', optId);
                     optionEl.innerHTML = `
                         <label>
-                            <input type="checkbox" name="answer" value="${index}">
-                            <span>${option || `Option ${index + 1}`}</span>
+                            <input type="checkbox" name="answer" value="${optId}" aria-label="${labelText}">
+                            <span>${labelText || `Option ${index + 1}`}</span>
                         </label>
                     `;
                     answerOptions.appendChild(optionEl);
                 });
             } else if (type === 'short_answer' || type === 'fill_in_the_blank') {
                 const optionEl = document.createElement('div');
-                optionEl.className = 'form-group'; // Use form-group for consistency
+                optionEl.className = 'form-group';
                 optionEl.innerHTML = `
                     <label for="short-answer-input">Your Answer:</label>
-                    <input type="text" id="short-answer-input" class="form-control" placeholder="Type your answer...">
+                    <input type="text" id="short-answer-input" class="form-control" placeholder="Type your answer..." aria-label="Short answer">
                 `;
                 answerOptions.appendChild(optionEl);
-                document.getElementById('short-answer-input')?.focus(); // Focus input
+                document.getElementById('short-answer-input')?.focus();
             } else {
-                 throw new Error(`Unsupported question type: ${type}`);
+                throw new Error(`Unsupported question type: ${type}`);
             }
         } catch (error) {
-             console.error("Error rendering answer options:", error, question);
-             answerOptions.innerHTML = `<p class="text-danger">Error displaying options for this question.</p>`;
+            console.error("Error rendering answer options:", error, question);
+            answerOptions.innerHTML = `<p class="text-danger">Error displaying options for this question.</p>`;
         }
     }
 
@@ -255,19 +291,28 @@ document.addEventListener('DOMContentLoaded', () => {
         submitAnswerBtn.disabled = true;
 
         const question = quizData[currentQuestionIndex];
-        if (!question) return; // Should not happen if logic is correct
+        if (!question) return;
 
         const userAnswer = getUserAnswer(question.question_type);
-        const timeSpent = (new Date() - questionStartTime) / 1000;
+        const timeSpent = Math.round((new Date() - (questionStartTime || new Date())) / 1000);
 
-        // Basic validation: Check if an answer was provided for relevant types
+        // Save question time locally
+        questionTimes.push(timeSpent);
+
+        // Basic validation
         if (userAnswer === null || (Array.isArray(userAnswer) && userAnswer.length === 0) || (typeof userAnswer === 'string' && userAnswer.trim() === '')) {
-             alert("Please select or type an answer.");
-             submitAnswerBtn.disabled = false;
-             startQuestionTimer(); // Resume timer if no answer selected
-             return;
+            alert("Please select or type an answer.");
+            submitAnswerBtn.disabled = false;
+            startQuestionTimer();
+            return;
         }
 
+        // Debug log of payload
+        console.log('Submitting answer payload:', {
+            qid: question.id ?? question.question ?? `index-${currentQuestionIndex}`,
+            sent_user_answer: userAnswer,
+            question_object: question
+        });
 
         try {
             const response = await fetch('/api/evaluate-answer', {
@@ -277,20 +322,22 @@ document.addEventListener('DOMContentLoaded', () => {
             });
 
             if (!response.ok) {
-                const errorText = await response.text(); // Get raw response text
-                throw new Error(`Failed to evaluate answer. Server response: ${errorText}`);
+                let errMsg = `HTTP status: ${response.status}`;
+                try { const err = await response.json(); errMsg = err.message || JSON.stringify(err); } catch(e){ try{ errMsg = await response.text(); }catch{} }
+                throw new Error(errMsg);
             }
 
             const data = await response.json();
-             if (!data.success || !data.evaluation || !data.feedback) {
-                 throw new Error(data.message || 'Invalid response format from evaluation endpoint.');
+            if (!data.success || !data.evaluation || !data.feedback) {
+                throw new Error(data.message || 'Invalid response format from evaluation endpoint.');
             }
 
             const { evaluation, feedback } = data;
 
             if (evaluation.is_correct) score++;
-            performanceHistory.push(evaluation.is_correct);
+            performanceHistory.push(!!evaluation.is_correct);
 
+            // Store answered question with time_spent key for server compatibility
             answeredQuestions.push({ question, userAnswer, evaluation, feedback, time_spent: timeSpent });
 
             showFeedback(feedback, evaluation);
@@ -300,13 +347,13 @@ document.addEventListener('DOMContentLoaded', () => {
             if (submitAnswerBtn) submitAnswerBtn.style.display = 'none';
             if (nextQuestionBtn) nextQuestionBtn.style.display = 'inline-block';
 
-            updateAdaptiveDifficulty(); // Check if difficulty should change
+            // Update difficulty in background
+            updateAdaptiveDifficulty();
 
         } catch (error) {
             console.error('Error submitting answer:', error);
-            alert(`Error submitting answer: ${error.message}\nPlease try again.`);
-            submitAnswerBtn.disabled = false; // Re-enable button on error
-            // Optionally restart timer or handle error state differently
+            showFlashMessage(`Error submitting answer: ${error.message}`, 'danger', 6000);
+            submitAnswerBtn.disabled = false;
         }
     }
 
@@ -314,24 +361,23 @@ document.addEventListener('DOMContentLoaded', () => {
     function getUserAnswer(type) {
         if (type === 'mcq_single') {
             const selected = document.querySelector('input[name="answer"]:checked');
-            return selected ? parseInt(selected.value, 10) : null;
+            return selected ? String(selected.value) : null;
         }
         if (type === 'true_false') {
             const selected = document.querySelector('input[name="answer"]:checked');
-            // Return boolean true/false, or null if nothing selected
-            return selected ? (selected.value === 'true') : null;
+            if (!selected) return null;
+            // Return boolean true/false for easier evaluation & review
+            return selected.value === 'true';
         }
         if (type === 'mcq_multiple') {
             const selected = document.querySelectorAll('input[name="answer"]:checked');
-            // Return array of selected indices, or empty array if none
-            return Array.from(selected).map(el => parseInt(el.value, 10));
+            return Array.from(selected).map(el => String(el.value));
         }
         if (type === 'short_answer' || type === 'fill_in_the_blank') {
             const inputEl = document.getElementById('short-answer-input');
-            // Return trimmed value, or empty string if input doesn't exist/is empty
             return inputEl ? inputEl.value.trim() : "";
         }
-        return null; // Default for unknown types
+        return null;
     }
 
     // --- 6. Show Inline Feedback ---
@@ -339,8 +385,8 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!feedbackContainer || !feedbackIcon || !feedbackText || !feedbackExplanation || !feedbackHint || !feedbackHeader) return;
 
         feedbackContainer.style.display = 'block';
-        feedbackIcon.textContent = feedback.status_icon || '?';
-        feedbackText.textContent = feedback.status_text || 'Feedback';
+        feedbackIcon.textContent = feedback.status_icon || '';
+        feedbackText.textContent = feedback.status_text || (evaluation.is_correct ? 'Correct' : 'Incorrect');
         feedbackExplanation.textContent = feedback.explanation || 'No explanation available.';
 
         if (feedback.hint) {
@@ -351,68 +397,82 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         const correctnessClass = evaluation.is_correct ? 'correct' : 'incorrect';
-        feedbackContainer.className = `card ${correctnessClass}`; // Apply class to container
-        feedbackHeader.className = correctnessClass; // Apply class to header for text color
+        feedbackContainer.className = `card ${correctnessClass}`;
+        feedbackHeader.className = correctnessClass;
     }
 
     // --- 7. Highlight Correct/Incorrect Options ---
     function highlightAnswers(question, evaluation) {
         if (!answerOptions) return;
         const type = question.question_type;
-        const optionsUI = answerOptions.querySelectorAll('.answer-option, .form-group'); // Include form-group for short answer
+        const optionsUI = answerOptions.querySelectorAll('.answer-option, .form-group');
 
-        // Disable all inputs within the options area
+        // Disable inputs
         answerOptions.querySelectorAll('input').forEach(input => input.disabled = true);
-        // Add a class to indicate submission state for styling
         answerOptions.classList.add('submitted');
 
-        try { // Add try block for safety
-            if (type === 'mcq_single' || type === 'true_false') {
-                // Ensure correct_answer from evaluation is used and is a string for comparison
-                const correctValue = String(evaluation.correct_answer);
+        try {
+            // Normalize expected answers into a set of strings
+            let expectedSet = new Set();
+            if (Array.isArray(evaluation.correct_answer)) {
+                (evaluation.correct_answer || []).forEach(v => expectedSet.add(String(v)));
+            } else if (evaluation.correct_answer !== undefined && evaluation.correct_answer !== null) {
+                // Special-case boolean correct answers from backend for true_false
+                if (typeof evaluation.correct_answer === 'boolean') {
+                    expectedSet.add(String(evaluation.correct_answer)); // 'true' or 'false'
+                } else {
+                    expectedSet.add(String(evaluation.correct_answer));
+                }
+            }
+
+            if (type === 'mcq_single' || type === 'true_false' || type === 'mcq_multiple') {
                 optionsUI.forEach(optionEl => {
                     const input = optionEl.querySelector('input');
-                    if (!input) return; // Skip if no input found
-                    optionEl.classList.add('submitted'); // Add class to parent div
-                    if (input.value === correctValue) {
-                        optionEl.classList.add('correct');
-                    } else if (input.checked) {
-                        optionEl.classList.add('incorrect', 'user-selected');
-                    }
-                });
-            } else if (type === 'mcq_multiple') {
-                // Ensure correct_answer is an array and map to strings
-                const correctValues = new Set((evaluation.correct_answer || []).map(String));
-                optionsUI.forEach(optionEl => {
-                    const input = optionEl.querySelector('input');
-                     if (!input) return;
+                    const optId = optionEl.getAttribute('data-option-id') || (input ? String(input.value) : null);
+                    if (!input) return;
                     optionEl.classList.add('submitted');
-                    if (correctValues.has(input.value)) {
+
+                    // if optId is in expected set -> correct
+                    if (optId && expectedSet.has(optId)) {
                         optionEl.classList.add('correct');
                     } else if (input.checked) {
+                        // user selected but not in expected -> incorrect
                         optionEl.classList.add('incorrect', 'user-selected');
                     }
                 });
             } else if (type === 'short_answer' || type === 'fill_in_the_blank') {
                 const inputEl = document.getElementById('short-answer-input');
-                if (inputEl) { // Check if input exists
-                    inputEl.disabled = true; // Ensure it's disabled
-                    // Add classes instead of inline styles for better CSS control
+                if (inputEl) {
+                    inputEl.disabled = true;
                     inputEl.classList.add(evaluation.is_correct ? 'correct-input' : 'incorrect-input');
-                     optionsUI.forEach(el => el.classList.add('submitted')); // Add submitted class to parent form-group
+                    optionsUI.forEach(el => el.classList.add('submitted'));
                 }
             }
-        } catch(error) {
-             console.error("Error highlighting answers:", error, question, evaluation);
+        } catch (error) {
+            console.error("Error highlighting answers:", error, question, evaluation);
         }
     }
 
-
     // --- 8. Load Next Question ---
     function loadNextQuestion() {
+        // Record time_spent for question if start time exists
+        if (questionStartTime) {
+            const elapsed = Math.round((new Date() - questionStartTime) / 1000);
+            questionTimes.push(elapsed);
+        }
+
         currentQuestionIndex++;
-        if (answerOptions) answerOptions.classList.remove('submitted'); // Remove submitted state
-        loadQuestion(currentQuestionIndex); // Will either load next or show results
+        if (answerOptions) {
+            answerOptions.classList.remove('submitted');
+            // remove option state classes to avoid carryover visual effects
+            answerOptions.querySelectorAll('.answer-option').forEach(el => {
+                el.classList.remove('correct', 'incorrect', 'user-selected', 'submitted');
+                // Also re-enable inputs just in case (they will be recreated by render)
+                const input = el.querySelector('input');
+                if (input) input.disabled = false;
+            });
+        }
+        loadQuestion(currentQuestionIndex);
     }
 
     // --- 9. Show Final Results ---
@@ -420,42 +480,75 @@ document.addEventListener('DOMContentLoaded', () => {
         stopQuestionTimer();
         if (quizContainer) quizContainer.style.display = 'none';
         if (quizResults) quizResults.style.display = 'block';
-        
+
         const total = quizData.length;
         const percentage = total > 0 ? Math.round((score / total) * 100) : 0;
-        
-        // Update the improved results display
+
+        if (quizStartTime) {
+            const endTime = new Date();
+            totalQuizTime = Math.floor((endTime - quizStartTime) / 1000);
+        }
+
         updateResultsDisplay(score, total, percentage);
-        
-        saveQuizAttempt(); // Save in background
-        fetchAIFeedback(); // Fetch in background
+
+        // Non-blocking saves/feedback; errors handled internally
+        saveQuizAttempt();
+        fetchAIFeedback();
         renderResultsReview();
     }
 
     // --- 9a. Update Results Display ---
     function updateResultsDisplay(correctScore, totalQuestions, percentage) {
-        // Update score elements
         const scorePercentage = document.getElementById('score-percentage');
         const scoreFraction = document.getElementById('score-fraction');
         const correctCount = document.getElementById('correct-count');
         const totalCount = document.getElementById('total-count');
         const gradeDisplay = document.getElementById('grade-display');
+        const accuracyScore = document.getElementById('accuracy-score');
+        const totalTime = document.getElementById('total-time');
+        const avgTimePerQuestion = document.getElementById('avg-time-per-question');
+        const completionTimestamp = document.getElementById('completion-timestamp');
+        const quizDifficulty = document.getElementById('quiz-difficulty');
         const completionEmoji = document.getElementById('completion-emoji');
         const performanceMessage = document.getElementById('performance-message');
-        
+
         if (scorePercentage) scorePercentage.textContent = `${percentage}%`;
         if (scoreFraction) scoreFraction.textContent = `${correctScore} / ${totalQuestions}`;
         if (correctCount) correctCount.textContent = correctScore;
         if (totalCount) totalCount.textContent = totalQuestions;
-        
-        // Calculate and display grade
+        if (accuracyScore) accuracyScore.textContent = `${percentage}%`;
+
+        if (totalTime) {
+            const minutes = Math.floor(totalQuizTime / 60);
+            const seconds = totalQuizTime % 60;
+            totalTime.textContent = `${minutes}:${seconds.toString().padStart(2, '0')}`;
+        }
+
+        if (avgTimePerQuestion) {
+            const avgTime = totalQuestions > 0 ? Math.round(totalQuizTime / totalQuestions) : 0;
+            avgTimePerQuestion.textContent = `${avgTime}s`;
+        }
+
+        if (completionTimestamp) {
+            const now = new Date();
+            const timeString = now.toLocaleTimeString('en-US', {
+                hour: 'numeric',
+                minute: '2-digit',
+                hour12: true
+            });
+            completionTimestamp.textContent = `Today, ${timeString}`;
+        }
+
+        if (quizDifficulty) {
+            quizDifficulty.textContent = currentDifficulty.charAt(0).toUpperCase() + currentDifficulty.slice(1);
+        }
+
         const grade = getGradeFromPercentage(percentage);
         if (gradeDisplay) {
             gradeDisplay.textContent = grade;
-            gradeDisplay.className = `score-value grade grade-${grade}`;
+            gradeDisplay.className = `score-value grade grade-${grade.replace('+','plus')}`;
         }
-        
-        // Update completion emoji based on performance
+
         if (completionEmoji) {
             if (percentage >= 90) completionEmoji.textContent = '🏆';
             else if (percentage >= 80) completionEmoji.textContent = '🎉';
@@ -464,14 +557,12 @@ document.addEventListener('DOMContentLoaded', () => {
             else if (percentage >= 50) completionEmoji.textContent = '📚';
             else completionEmoji.textContent = '💪';
         }
-        
-        // Update performance message
+
         if (performanceMessage) {
             const message = getPerformanceMessage(percentage);
             performanceMessage.innerHTML = `<p>${message}</p>`;
         }
-        
-        // Update score circle with animated progress
+
         updateScoreCircle(percentage);
     }
 
@@ -506,36 +597,47 @@ document.addEventListener('DOMContentLoaded', () => {
     function updateScoreCircle(percentage) {
         const scoreCircle = document.querySelector('.score-circle');
         if (!scoreCircle) return;
-        
-        // Calculate the angle for the conic gradient
+
         const angle = (percentage / 100) * 360;
-        
-        // Determine color based on performance
-        let color = '#5b86e5'; // Default blue
-        if (percentage >= 90) color = '#28a745'; // Green
-        else if (percentage >= 70) color = '#17a2b8'; // Cyan
-        else if (percentage >= 50) color = '#ffc107'; // Yellow
-        else color = '#dc3545'; // Red
-        
-        // Update the conic gradient
+
+        let color = '#5b86e5';
+        if (percentage >= 90) color = '#28a745';
+        else if (percentage >= 70) color = '#17a2b8';
+        else if (percentage >= 50) color = '#ffc107';
+        else color = '#dc3545';
+
         scoreCircle.style.background = `conic-gradient(${color} ${angle}deg, #e9ecef ${angle}deg)`;
-        
-        // Add animation class for smooth transition
         scoreCircle.style.transition = 'background 1s ease-in-out';
     }
 
     // --- 10. Save Quiz Attempt ---
     async function saveQuizAttempt() {
-        const topicEl = document.getElementById('material_topic') || document.getElementById('topic');
-        const topic = topicEl ? topicEl.value : 'Quiz Topic'; // Provide default
+        let topic = 'General Knowledge';
+        const materialTopicEl = document.getElementById('material_topic');
+        const topicEl = document.getElementById('topic');
+
+        if (materialTopicEl && materialTopicEl.value && materialTopicEl.value.trim() !== '') {
+            topic = materialTopicEl.value;
+        } else if (topicEl && topicEl.value) {
+            topic = topicEl.value;
+        }
 
         const answersPayload = answeredQuestions.map(aq => ({
-            question: aq.question, userAnswer: aq.userAnswer, // Corrected variable name
-            evaluation: aq.evaluation, feedback: aq.feedback,
-            time_spent: Math.round(aq.time_spent || 0) // Use correct variable name and default
+            question: aq.question,
+            userAnswer: aq.userAnswer,
+            evaluation: aq.evaluation,
+            feedback: aq.feedback,
+            time_spent: Math.round(aq.time_spent || 0)
         }));
 
         try {
+            console.log('Saving quiz attempt with data:', {
+                topic: topic,
+                score: score,
+                total_questions: quizData.length,
+                answers_count: answersPayload.length
+            });
+
             const response = await fetch('/api/save-attempt', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -545,22 +647,33 @@ document.addEventListener('DOMContentLoaded', () => {
                 })
             });
             if (!response.ok) {
-                 const errorData = await response.json(); // Try to get error message
-                 throw new Error(errorData.message || `HTTP error! Status: ${response.status}`);
+                let err = `HTTP status: ${response.status}`;
+                try { const j = await response.json(); err = j.message || JSON.stringify(j); } catch(e) { try { err = await response.text(); } catch{} }
+                throw new Error(err);
             }
-            console.log('Quiz attempt saved successfully.');
+            console.log('Quiz attempt saved successfully with topic:', topic);
         } catch (error) {
             console.error('Error saving quiz attempt:', error);
-            // Optionally inform user non-critically: showFlashMessage('Could not save attempt details.', 'warning');
+            // Non-critical: inform user briefly
+            showFlashMessage('Could not save attempt details (offline).', 'warning', 4000);
         }
     }
 
     // --- 11. Fetch AI Feedback ---
-     async function fetchAIFeedback() {
+    async function fetchAIFeedback() {
         if (!aiFeedbackContainer) return;
         aiFeedbackContainer.innerHTML = '<p class="loading">Generating personalized feedback...</p>';
-        const topicEl = document.getElementById('material_topic') || document.getElementById('topic');
-        const topic = topicEl ? topicEl.value : 'Quiz Topic';
+
+        let topic = 'General Knowledge';
+        const materialTopicEl = document.getElementById('material_topic');
+        const topicEl = document.getElementById('topic');
+
+        if (materialTopicEl && materialTopicEl.value && materialTopicEl.value.trim() !== '') {
+            topic = materialTopicEl.value;
+        } else if (topicEl && topicEl.value) {
+            topic = topicEl.value;
+        }
+
         const incorrect_questions = answeredQuestions
             .filter(aq => !aq.evaluation.is_correct)
             .map(aq => aq.question.question);
@@ -575,14 +688,14 @@ document.addEventListener('DOMContentLoaded', () => {
                 })
             });
             if (!response.ok) {
-                 const errorData = await response.json();
-                 throw new Error(errorData.message || `HTTP error! Status: ${response.status}`);
+                let err = `HTTP status: ${response.status}`;
+                try { const j = await response.json(); err = j.message || JSON.stringify(j); } catch(e){ try { err = await response.text(); } catch{} }
+                throw new Error(err);
             }
 
             const data = await response.json();
             if (data.success && data.feedback) {
                 const fb = data.feedback;
-                // Add checks for null/undefined feedback parts
                 aiFeedbackContainer.innerHTML = `
                     <h3>Personalized Feedback</h3>
                     <p><strong>${fb.encouragement || ''}</strong></p>
@@ -591,7 +704,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     <p><em>${fb.motivation || ''}</em></p>
                 `;
             } else {
-                 throw new Error(data.message || 'Invalid feedback response from server.');
+                throw new Error(data.message || 'Invalid feedback response from server.');
             }
         } catch (error) {
             console.error('Error fetching AI feedback:', error);
@@ -602,7 +715,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // --- 12. Render Results Review ---
     function renderResultsReview() {
         if (!resultsReviewArea) return;
-        resultsReviewArea.innerHTML = '<h3>Review Your Answers</h3>'; // Reset content
+        resultsReviewArea.innerHTML = '<h3>Review Your Answers</h3>';
 
         if (!answeredQuestions || answeredQuestions.length === 0) {
             resultsReviewArea.innerHTML += '<p>No answers recorded for review.</p>';
@@ -613,17 +726,29 @@ document.addEventListener('DOMContentLoaded', () => {
             const item = document.createElement('div');
             item.className = 'review-item';
 
-            let answerSummary = '<p>Error displaying answer details.</p>'; // Default error message
-            try { // Wrap rendering logic in try...catch
-                const type = aq.question?.question_type; // Use optional chaining
-                const ua = aq.userAnswer; // Correct variable name
-                const ca = aq.evaluation?.correct_answer; // Use optional chaining
-                const opts = aq.question?.options || [];
-                const isCorrect = aq.evaluation?.is_correct;
+            let answerSummary = '<p>Error displaying answer details.</p>';
+            try {
+                const type = aq.question?.question_type;
+                const ua = aq.userAnswer;
+                const ca = aq.evaluation?.correct_answer;
+                const optsRaw = aq.question?.options || [];
+
+                const idToLabel = {};
+                // map indices and ids to labels
+                optsRaw.forEach((opt, i) => {
+                    if (typeof opt === 'object') {
+                        if (opt.id !== undefined) idToLabel[String(opt.id)] = opt.label ?? String(opt.id);
+                        idToLabel[String(i)] = opt.label ?? `Option ${i+1}`;
+                    } else {
+                        idToLabel[String(i)] = String(opt);
+                    }
+                });
+
+                const isCorrect = !!aq.evaluation?.is_correct;
 
                 if (type === 'mcq_single') {
-                    const userAnswerText = (ua !== null && ua >= 0 && ua < opts.length) ? opts[ua] : 'No answer';
-                    const correctAnswerText = (ca !== null && ca >= 0 && ca < opts.length) ? opts[ca] : 'N/A';
+                    const userAnswerText = (ua !== null && ua !== undefined) ? (idToLabel[String(ua)] || String(ua)) : 'No answer';
+                    const correctAnswerText = (ca !== null && ca !== undefined) ? (idToLabel[String(ca)] || String(ca)) : 'N/A';
                     answerSummary = `
                         <div class="review-answer ${isCorrect ? 'correct' : 'incorrect'}">Your answer: <span>${userAnswerText}</span></div>
                         ${!isCorrect ? `<div class="review-answer correct">Correct answer: <span>${correctAnswerText}</span></div>` : ''}
@@ -636,8 +761,12 @@ document.addEventListener('DOMContentLoaded', () => {
                         ${!isCorrect ? `<div class="review-answer correct">Correct answer: <span>${correctAnswerText}</span></div>` : ''}
                     `;
                 } else if (type === 'mcq_multiple') {
-                    const userAnswersText = (Array.isArray(ua) && ua.length > 0) ? ua.map(i => (i >= 0 && i < opts.length) ? opts[i] : '?').join(', ') : 'No answer';
-                    const correctAnswersText = (Array.isArray(ca) && ca.length > 0) ? ca.map(i => (i >= 0 && i < opts.length) ? opts[i] : '?').join(', ') : 'N/A';
+                    const userAnswersText = (Array.isArray(ua) && ua.length > 0)
+                        ? ua.map(x => idToLabel[String(x)] || String(x)).join(', ')
+                        : 'No answer';
+                    const correctAnswersText = (Array.isArray(ca) && ca.length > 0)
+                        ? ca.map(x => idToLabel[String(x)] || String(x)).join(', ')
+                        : 'N/A';
                     answerSummary = `
                         <div class="review-answer ${isCorrect ? 'correct' : 'incorrect'}">Your answer: <span>${userAnswersText}</span></div>
                         <div class="review-answer correct">Correct answer(s): <span>${correctAnswersText}</span></div>
@@ -648,14 +777,12 @@ document.addEventListener('DOMContentLoaded', () => {
                         ${!isCorrect ? `<div class="review-answer correct">Correct answer: <span>${ca || 'N/A'}</span></div>` : ''}
                     `;
                 } else {
-                     answerSummary = `<p>Unsupported question type for review: ${type}</p>`;
+                    answerSummary = `<p>Unsupported question type for review: ${type}</p>`;
                 }
-            } catch(renderErr) {
-                 console.error("Error rendering review summary:", renderErr, aq);
-                 // Keep the default error message in answerSummary
+            } catch (renderErr) {
+                console.error("Error rendering review summary:", renderErr, aq);
             }
 
-            // Ensure feedback and question objects exist before accessing properties
             const questionTextContent = aq.question?.question || '[Question Text Missing]';
             const explanationText = aq.feedback?.explanation || 'No explanation available.';
 
@@ -668,17 +795,16 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-
-    // *** NEW: Flash Message Function ***
+    // *** Flash Message Function ***
     function showFlashMessage(message, type = 'info', duration = 4000) {
-        if (!flashNotification) { console.warn("Flash notification element not found."); return; }
+        if (!flashNotification) { console.warn("Flash notification element not found."); alert(message); return; }
 
-        clearTimeout(flashTimeout); // Clear previous timeout
+        clearTimeout(flashTimeout);
 
         flashNotification.textContent = message;
-        flashNotification.className = `flash-notification ${type}`; // Apply type class
+        flashNotification.className = `flash-notification ${type}`;
 
-        // Force reflow to allow transition
+        // Force reflow
         void flashNotification.offsetWidth;
 
         flashNotification.classList.add('show');
@@ -688,49 +814,39 @@ document.addEventListener('DOMContentLoaded', () => {
             flashTimeout = null;
         }, duration);
     }
-    // *** END NEW ***
-
 
     // --- 13. Update Adaptive Difficulty ---
     async function updateAdaptiveDifficulty() {
-         // Send request after every answer
         try {
             const response = await fetch('/api/update-difficulty', {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ performance_history: performanceHistory, current_difficulty: currentDifficulty })
             });
-            // Don't throw error if request fails, just log it. Difficulty update is non-critical.
             if (!response.ok) {
-                 console.warn(`Failed to update difficulty: ${response.status}`);
-                 return;
+                console.warn(`Failed to update difficulty: ${response.status}`);
+                return;
             }
 
             const data = await response.json();
             if (data.success && data.difficulty_changed) {
                 const oldDifficulty = currentDifficulty;
-                currentDifficulty = data.recommended_difficulty; // Update JS state
+                currentDifficulty = data.recommended_difficulty;
                 console.log(`Adaptive difficulty updated: ${oldDifficulty} -> ${currentDifficulty}`);
-
-                // *** Use Flash Message ***
-                showFlashMessage(`Difficulty adjusted: ${oldDifficulty.toUpperCase()} → ${currentDifficulty.toUpperCase()}`, 'info');
-
+                showFlashMessage(`Difficulty adjusted: ${oldDifficulty.toUpperCase()} → ${currentDifficulty.toUpperCase()}`, 'info', 3500);
             } else if (data.success) {
-                // Difficulty checked, no change recommended
-                 console.log(`Difficulty remains: ${currentDifficulty}`);
+                console.log(`Difficulty remains: ${currentDifficulty}`);
             } else {
-                 console.warn(`Update difficulty API call failed: ${data.message}`);
+                console.warn(`Update difficulty API call failed: ${data.message}`);
             }
         } catch (error) {
             console.error('Error in updateAdaptiveDifficulty fetch:', error);
-            // Optionally show error flash: showFlashMessage('Could not update difficulty.', 'warning');
         }
     }
-
 
     // --- 14. Submit Question Feedback ---
     async function submitQuestionFeedback(e) {
         e.preventDefault();
-        if (!feedbackComment || !feedbackFlag || !feedbackAlert || !questionFeedbackForm) return; // Safety check
+        if (!feedbackComment || !feedbackFlag || !feedbackAlert || !questionFeedbackForm) return;
 
         const question = quizData[currentQuestionIndex];
         const feedback_text = feedbackComment.value;
@@ -738,7 +854,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         if (!feedback_text.trim()) {
             feedbackAlert.textContent = 'Please enter feedback.';
-            feedbackAlert.className = 'flash danger'; // Use flash style
+            feedbackAlert.className = 'flash danger';
             feedbackAlert.style.display = 'block';
             return;
         }
@@ -748,31 +864,30 @@ document.addEventListener('DOMContentLoaded', () => {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ question_text: question?.question || '[N/A]', feedback_text, is_flagged })
             });
-             if (!response.ok) {
-                 const errorData = await response.json();
-                 throw new Error(errorData.message || `HTTP Error: ${response.status}`);
-             }
+            if (!response.ok) {
+                let err = `HTTP status: ${response.status}`;
+                try { const j = await response.json(); err = j.message || JSON.stringify(j); } catch(e){ try{ err = await response.text(); }catch{} }
+                throw new Error(err);
+            }
 
             const data = await response.json();
             feedbackAlert.textContent = data.message || 'Feedback sent.';
-            feedbackAlert.className = 'flash success'; // Use flash style
+            feedbackAlert.className = 'flash success';
             feedbackAlert.style.display = 'block';
             questionFeedbackForm.reset();
 
-            // Optionally hide the alert after a few seconds
             setTimeout(() => { if(feedbackAlert) feedbackAlert.style.display = 'none'; }, 5000);
-
         } catch (error) {
             console.error('Submit feedback error:', error);
             feedbackAlert.textContent = `Error: ${error.message}`;
-            feedbackAlert.className = 'flash danger'; // Use flash style
+            feedbackAlert.className = 'flash danger';
             feedbackAlert.style.display = 'block';
         }
     }
 
     // --- 15. Question Timer ---
     function startQuestionTimer() {
-        stopQuestionTimer(); // Clear existing timer
+        stopQuestionTimer();
         let seconds = 0;
         if (questionTimer) questionTimer.textContent = 'Time: 0s';
 

@@ -29,14 +29,8 @@
             <input type="number" id="num_questions" class="form-control" value="10" min="5" max="30" required>
         </div>
 
-        <div class="form-group">
-            <label for="difficulty">Difficulty</label>
-            <select id="difficulty" class="form-control">
-                <option value="easy">Easy</option>
-                <option value="medium" selected>Medium</option>
-                <option value="hard">Hard</option>
-                <option value="mixed">Mixed</option>
-            </select>
+        <div class="form-group-info">
+             <p>Your quiz difficulty is <strong>adaptive</strong> and is based on your performance. You can view or reset your current level on your <strong><a href="{{ url_for('profile') }}">Profile</a></strong> page.</p>
         </div>
 
         <button type="submit" class="btn btn-primary btn-block">Start Quiz</button>
